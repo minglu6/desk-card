@@ -1,0 +1,40 @@
+# Generated outputs / per-run caches
+out/
+
+# Clawd reference photos (third-party, large, only needed by the subagent that
+# designed the sprite — the committed make_clawd.py is the source of truth).
+assets/clawd_source*
+assets/clawd_pfp*
+assets/clawd_sight*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Android / Gradle build artefacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/captures/
+*.iml
+.idea/
+
+# IDE / editor
+.vscode/
+.cursor/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local config — never commit secrets
+.env
+.env.local
+*.key
+*.credentials

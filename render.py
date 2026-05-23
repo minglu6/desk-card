@@ -1,0 +1,985 @@
+"""Desk Card renderer — JSON in, PNG out (1404x1872 for Likebook K78W)."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+import usage_reader
+import weather_api
+import quotes
+import todos as todos_module
+
+try:
+    import cnlunar  # type: ignore
+except ImportError:
+    cnlunar = None
+
+W, H = 1404, 1872
+MARGIN = 90
+BLACK, WHITE = 0, 255
+GREY = 90
+
+FONTS = {
+    "sans":       r"C:\Windows\Fonts\msyh.ttc",
+    "sans_bold":  r"C:\Windows\Fonts\msyhbd.ttc",
+    "sans_light": r"C:\Windows\Fonts\msyhl.ttc",
+    "serif":      r"C:\Windows\Fonts\STSONG.TTF",
+    "serif_zh":   r"C:\Windows\Fonts\STZHONGS.TTF",
+    "kai":        r"C:\Windows\Fonts\STKAITI.TTF",
+    # English: single connected script (Segoe Script Bold) for visual consistency
+    "geo":        r"C:\Windows\Fonts\segoescb.ttf",
+    "geo_b":      r"C:\Windows\Fonts\segoescb.ttf",
+    "geo_i":      r"C:\Windows\Fonts\segoescb.ttf",
+    "mono":       r"C:\Windows\Fonts\consola.ttf",
+    "mono_bold":  r"C:\Windows\Fonts\consolab.ttf",
+}
+
+# Per-render font overrides (set by render() when payload has a "fonts" dict).
+_FONT_OVERRIDES: dict[str, str] = {}
+
+# Module-level reference to the current PIL image during a render call so deep
+# helpers (e.g. _draw_usage_row → Clawd marker overlay) can paste sprites.
+_CURRENT_IMG: Image.Image | None = None
+
+CN_MONTH = "一二三四五六七八九十"
+CN_NUM = "〇一二三四五六七八九"
+WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
+
+
+# ---- Pixel-art weather icons (matching Clawd's monochrome shadow-puppet style) ----
+WEATHER_ICONS = {
+    "SUN": [
+        ".....#.....",
+        ".....#.....",
+        ".#...#...#.",
+        "...#####...",
+        "..#######..",
+        ".#########.",
+        "###########",
+        ".#########.",
+        "..#######..",
+        "...#####...",
+        ".#...#...#.",
+        ".....#.....",
+        ".....#.....",
+    ],
+    "CLOUD": [
+        "......######......",
+        "....##########....",
+        "...############...",
+        ".###############..",
+        "##################",
+        "##################",
+        "##################",
+        ".################.",
+        "..##############..",
+        "....##########....",
+    ],
+    "SUN_CLOUD": [
+        "...#..........",
+        "...#...####...",
+        "#..#..######..",
+        ".#####.####...",
+        "..####.####...",
+        "...##.###.####",
+        "..#############",
+        ".###############",
+        "################",
+        "################",
+        ".##############.",
+        "...############.",
+    ],
+    "RAIN": [
+        "......######......",
+        "....##########....",
+        "...############...",
+        ".###############..",
+        "##################",
+        "##################",
+        "##################",
+        ".################.",
+        "..##############..",
+        "..................",
+        "..#....#....#...#.",
+        ".#....#....#...#..",
+        "#....#....#...#...",
+    ],
+    "SNOW": [
+        "......######......",
+        "....##########....",
+        "...############...",
+        ".###############..",
+        "##################",
+        "##################",
+        "##################",
+        ".################.",
+        "..##############..",
+        "..................",
+        "..#...#...#...#...",
+        ".###.###.###.###..",
+        "..#...#...#...#...",
+    ],
+    "HAZE": [
+        "...########...",
+        "..##########..",
+        "##############",
+        ".############.",
+        "..............",
+        ".############.",
+        "##############",
+        ".############.",
+        "..............",
+        "...########...",
+        "..##########..",
+    ],
+}
+
+SKYCON_TO_ICON = {
+    "CLEAR_DAY": "SUN",
+    "CLEAR_NIGHT": "SUN",
+    "PARTLY_CLOUDY_DAY": "SUN_CLOUD",
+    "PARTLY_CLOUDY_NIGHT": "SUN_CLOUD",
+    "CLOUDY": "CLOUD",
+    "LIGHT_HAZE": "HAZE",
+    "MODERATE_HAZE": "HAZE",
+    "HEAVY_HAZE": "HAZE",
+    "LIGHT_RAIN": "RAIN",
+    "MODERATE_RAIN": "RAIN",
+    "HEAVY_RAIN": "RAIN",
+    "STORM_RAIN": "RAIN",
+    "FOG": "HAZE",
+    "LIGHT_SNOW": "SNOW",
+    "MODERATE_SNOW": "SNOW",
+    "HEAVY_SNOW": "SNOW",
+    "STORM_SNOW": "SNOW",
+    "DUST": "HAZE",
+    "SAND": "HAZE",
+    "WIND": "CLOUD",
+}
+
+
+def draw_skycon_icon(d: "ImageDraw.ImageDraw", *, x_right: int, y: int,
+                     skycon: str, scale: int = 7) -> int:
+    """Draw a pixel-art weather icon right-aligned at x_right.
+    Returns the icon's WIDTH so callers can lay out adjacent text."""
+    icon_name = SKYCON_TO_ICON.get(skycon or "")
+    if not icon_name:
+        return 0
+    grid = WEATHER_ICONS.get(icon_name)
+    if not grid:
+        return 0
+    rows = len(grid)
+    cols = max(len(row) for row in grid)
+    icon_w = cols * scale
+    icon_h = rows * scale
+    x_start = x_right - icon_w
+    for ry, row in enumerate(grid):
+        for cx, ch in enumerate(row.ljust(cols, ".")):
+            if ch != "#":
+                continue
+            x0 = x_start + cx * scale
+            y0 = y + ry * scale
+            d.rectangle([x0, y0, x0 + scale - 1, y0 + scale - 1], fill=BLACK)
+    return icon_w
+
+
+def f(key: str, size: int) -> ImageFont.FreeTypeFont:
+    """Resolve a font by logical key; checks per-render overrides first."""
+    path = _FONT_OVERRIDES.get(key) or FONTS[key]
+    return ImageFont.truetype(path, size)
+
+
+def cn_day(n: int) -> str:
+    """1..31 → 一/二.../十一/.../三十一."""
+    if n <= 10:
+        return CN_NUM[n]
+    if n < 20:
+        return "十" + (CN_NUM[n - 10] if n > 10 else "")
+    tens, ones = divmod(n, 10)
+    return CN_NUM[tens] + "十" + (CN_NUM[ones] if ones else "")
+
+
+def cn_month(n: int) -> str:
+    return (CN_MONTH[n - 1] if n <= 10 else "十" + (CN_MONTH[n - 11] if n > 10 else "")) + "月"
+
+
+def hrule(d: ImageDraw.ImageDraw, y: int, x1: int = MARGIN, x2: int = W - MARGIN, width: int = 2):
+    d.line([(x1, y), (x2, y)], fill=BLACK, width=width)
+
+
+def double_rule(d: ImageDraw.ImageDraw, y: int, gap: int = 6, thick: int = 3, thin: int = 1, **kw):
+    hrule(d, y, width=thick, **kw)
+    hrule(d, y + gap + thick, width=thin, **kw)
+
+
+def double_rule_thin_thick(d: ImageDraw.ImageDraw, y: int, gap: int = 6, thin: int = 1, thick: int = 3, **kw):
+    hrule(d, y, width=thin, **kw)
+    hrule(d, y + gap + thin, width=thick, **kw)
+
+
+def text_w(d: ImageDraw.ImageDraw, s: str, font) -> int:
+    b = d.textbbox((0, 0), s, font=font)
+    return b[2] - b[0]
+
+
+def draw_spaced(d: ImageDraw.ImageDraw, xy, text: str, font, fill=BLACK, spacing: int = 12):
+    x, y = xy
+    for ch in text:
+        d.text((x, y), ch, font=font, fill=fill)
+        x += text_w(d, ch, font) + spacing
+    return x
+
+
+def draw_centered(d: ImageDraw.ImageDraw, y: int, text: str, font, fill=BLACK):
+    w = text_w(d, text, font)
+    d.text(((W - w) // 2, y), text, font=font, fill=fill)
+
+
+def draw_masthead(d: ImageDraw.ImageDraw, now: datetime, issue: str) -> int:
+    """Top: double rule, masthead text, double rule."""
+    top = 64
+    double_rule(d, top, gap=4, thick=3, thin=1)
+
+    band_y = top + 16
+    left = "Desk · Card"
+    mid_date = now.strftime("%b %d, %Y")
+    right = f"No. {issue}"
+    f_mast = f("geo_b", 48)
+    f_mid = f("geo_i", 36)
+
+    d.text((MARGIN, band_y), left, font=f_mast, fill=BLACK)
+    mw = text_w(d, mid_date, f_mid)
+    d.text(((W - mw) // 2, band_y + 14), mid_date, font=f_mid, fill=BLACK)
+    rw = text_w(d, right, f_mid)
+    d.text((W - MARGIN - rw, band_y + 14), right, font=f_mid, fill=BLACK)
+
+    bottom_rule_y = band_y + 78
+    double_rule_thin_thick(d, bottom_rule_y, gap=4, thin=1, thick=3)
+    return bottom_rule_y + 26
+
+
+def draw_time_band(d: ImageDraw.ImageDraw, now: datetime, y: int) -> int:
+    """Massive sans-serif HH:MM centered, with weather flanks on L/R, then Chinese date + lunar."""
+    f_time = f("sans_bold", 280)
+    time_str = now.strftime("%H:%M")
+    tw = text_w(d, time_str, f_time)
+    tx = (W - tw) // 2
+    d.text((tx, y), time_str, font=f_time, fill=BLACK)
+    tb = d.textbbox((tx, y), time_str, font=f_time)
+    time_bottom = tb[3]
+
+    # Weather flanks: left and right of the time digits
+    _draw_weather_flanks(d, y, time_left=tb[0], time_right=tb[2])
+
+    # Gregorian Chinese date
+    y2 = time_bottom + 38
+    date_text = f"二〇{cn_year_short(now.year)} 年 {cn_month(now.month)} {cn_day(now.day)} 日 · 星期{WEEKDAYS[now.weekday()]}"
+    f_date = f("serif_zh", 38)
+    spacing = 10
+    total_w = sum(text_w(d, ch, f_date) + spacing for ch in date_text) - spacing
+    draw_spaced(d, ((W - total_w) // 2, y2), date_text, f_date, spacing=spacing)
+
+    # Lunar line
+    y3 = y2 + 56
+    lunar = _lunar_line(now)
+    if lunar:
+        f_lunar = f("kai", 32)
+        lspacing = 8
+        lw = sum(text_w(d, ch, f_lunar) + lspacing for ch in lunar) - lspacing
+        draw_spaced(d, ((W - lw) // 2, y3), lunar, f_lunar, fill=GREY, spacing=lspacing)
+        y_rule = y3 + 56
+    else:
+        y_rule = y2 + 70
+
+    hrule(d, y_rule, width=1)
+    return y_rule + 28
+
+
+def _lunar_line(now: datetime) -> str:
+    if cnlunar is None:
+        return ""
+    try:
+        l = cnlunar.Lunar(now, godType="8char")
+    except Exception:
+        return ""
+    parts = [
+        f"{l.year8Char}{l.chineseYearZodiac}年",
+        l.lunarMonthCn.rstrip("大小") + l.lunarDayCn,
+    ]
+    # If today is a solar term, show it; otherwise show next one with distance.
+    today_term = getattr(l, "todaySolarTerms", "")
+    if today_term and today_term != "无":
+        parts.append(f"节气 · {today_term}")
+    else:
+        nxt = getattr(l, "nextSolarTerm", None)
+        nd = getattr(l, "nextSolarTermDate", None)
+        ny = getattr(l, "nextSolarTermYear", None)
+        if nxt and nd and ny:
+            try:
+                target = datetime(ny, nd[0], nd[1])
+                days = (target.date() - now.date()).days
+                if days >= 0:
+                    parts.append(f"次{nxt} · 余 {days} 日")
+            except Exception:
+                pass
+    return "  ·  ".join(parts)
+
+
+
+def cn_year_short(y: int) -> str:
+    s = str(y)[2:]
+    return "".join(CN_NUM[int(c)] for c in s)
+
+
+def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *, show_extra: bool = False, **_) -> int:
+    """Big primary widget: real Claude Code rate-limit % + reset time, 5h + 7d (+ extra opt-in)."""
+    from datetime import datetime, timezone
+
+    official = usage_reader.read_official() or {}
+    plan = official.get("plan") or "—"
+
+    # Local message counts as a nice secondary stat
+    try:
+        local = usage_reader.scan(window_hours=(5, 168))
+    except Exception:
+        local = {}
+    msg_5h = (local.get(5) or {}).get("messages", 0)
+    msg_7d = (local.get(168) or {}).get("messages", 0)
+
+    pct_5h = official.get("five_hour_pct")
+    pct_7d = official.get("seven_day_pct")
+    reset_5h = official.get("five_hour_reset_at")
+    reset_7d = official.get("seven_day_reset_at")
+    extra_usage = official.get("extra_usage") or {}
+
+    # Section heading
+    f_section_en = f("geo_b", 64)
+    f_plan = f("geo_i", 38)
+    en = "Claude  Code  Usage"
+    plan_str = f"plan : {plan}"
+    d.text((MARGIN, y), en, font=f_section_en, fill=BLACK)
+    pw = text_w(d, plan_str, f_plan)
+    d.text((W - MARGIN - pw, y + 22), plan_str, font=f_plan, fill=GREY)
+    y += 86
+    hrule(d, y, width=1)
+    y += 40
+
+    # ---- 5h block ----
+    y = _draw_usage_row(d, y,
+                        label_en="5 Hour",
+                        pct=pct_5h,
+                        right_lines=_reset_lines(reset_5h, fmt="hm"),
+                        extra=f"opus-4-7  ·  {msg_5h} msg (local)")
+    y += 22
+
+    # ---- 7d block ----
+    y = _draw_usage_row(d, y,
+                        label_en="7 Day",
+                        pct=pct_7d,
+                        right_lines=_reset_lines(reset_7d, fmt="dh"),
+                        extra=f"{msg_7d} msg total (local)")
+    y += 22
+
+    # extra_usage (overflow $ credits) — hidden by default; opt-in via show_extra
+    if show_extra and extra_usage.get("enabled") and extra_usage.get("pct") is not None:
+        used = extra_usage.get("used_credits") or 0
+        limit = extra_usage.get("monthly_limit") or 0
+        cur = extra_usage.get("currency") or "USD"
+        right_lines = (
+            "monthly cap",
+            f"${used:.0f} / ${limit:.0f}",
+            f"{cur}",
+        )
+        y += 22
+        y = _draw_usage_row(d, y,
+                            label_en="Extra  Credits",
+                            pct=extra_usage.get("pct"),
+                            right_lines=right_lines,
+                            extra="overflow / pay-as-you-go")
+    return y
+
+
+def _reset_lines(reset_at, *, fmt: str) -> tuple[str, str, str]:
+    """Three lines for the right side: label, time, countdown."""
+    from datetime import datetime, timezone
+    if not reset_at:
+        return ("resets at", "—", "—")
+    now = datetime.now(timezone.utc)
+    delta = reset_at - now
+    local_reset = reset_at.astimezone()
+    if fmt == "dh":
+        countdown = usage_reader.fmt_elapsed_dh(delta)
+        time_str = local_reset.strftime("%a  %H:%M")
+    else:
+        countdown = usage_reader.fmt_elapsed_hm(delta)
+        time_str = local_reset.strftime("%H:%M")
+    return ("resets at", time_str, f"in {countdown}")
+
+
+def _draw_usage_row(d: ImageDraw.ImageDraw, y: int, *, label_en: str,
+                    pct, right_lines: tuple, extra: str) -> int:
+    """One usage row: label + huge %, 3-line right block, progress bar."""
+    f_label_en = f("geo_b", 52)
+    f_pct = f("geo_b", 58)
+    f_pct_sign = f("geo_b", 34)
+    f_r_top = f("geo_i", 36)
+    f_r_mid = f("geo_b", 48)
+    f_r_bot = f("geo_b", 40)
+    f_extra = f("geo_i", 32)
+
+    # Label row
+    d.text((MARGIN, y), label_en, font=f_label_en, fill=BLACK)
+    y += 64
+
+    # Huge percentage (left)
+    if pct is None:
+        pct_str = "—"
+        pct_norm = 0.0
+    else:
+        pct_str = f"{int(round(pct))}"
+        pct_norm = max(0.0, min(1.0, pct / 100.0))
+    pw = text_w(d, pct_str, f_pct)
+    px = MARGIN + 20
+    d.text((px, y), pct_str, font=f_pct, fill=BLACK)
+    if pct is not None:
+        d.text((px + pw + 6, y + 18), "%", font=f_pct_sign, fill=GREY)
+
+    # Right side: 3 lines, all enlarged
+    right_x = W - MARGIN
+    top_s, mid_s, bot_s = right_lines
+    d.text((right_x - text_w(d, top_s, f_r_top), y - 6),
+           top_s, font=f_r_top, fill=GREY)
+    d.text((right_x - text_w(d, mid_s, f_r_mid), y + 36),
+           mid_s, font=f_r_mid, fill=BLACK)
+    d.text((right_x - text_w(d, bot_s, f_r_bot), y + 90),
+           bot_s, font=f_r_bot, fill=BLACK)
+
+    y += 140  # below the percentage / right block
+
+    # Reserve space above the bar for Clawd to ride
+    y += 60
+
+    # Progress bar
+    bar_x1, bar_x2 = MARGIN, W - MARGIN
+    bar_h = 22
+    d.rectangle([bar_x1, y, bar_x2, y + bar_h], outline=BLACK, width=3)
+    fill_x = bar_x1 + int((bar_x2 - bar_x1) * pct_norm)
+    if fill_x > bar_x1 + 3:
+        d.rectangle([bar_x1 + 3, y + 3, fill_x, y + bar_h - 3], fill=BLACK)
+
+    # Clawd rides the bar — x = current pct, feet rest on the bar top
+    if _CURRENT_IMG is not None and pct is not None:
+        clawd_h = 56
+        # source sprite is ~236w × 166h
+        clawd_w_est = int(clawd_h * 236 / 166)
+        marker_x = bar_x1 + int((bar_x2 - bar_x1) * pct_norm) - clawd_w_est // 2
+        marker_x = max(bar_x1, min(bar_x2 - clawd_w_est, marker_x))
+        marker_y = y - clawd_h + 4   # feet overlap top edge of bar by ~4 px
+        draw_clawd(_CURRENT_IMG, d, x=marker_x, y=marker_y, size=clawd_h)
+
+    # Extra small line below the bar
+    d.text((MARGIN + 20, y + bar_h + 8), extra, font=f_extra, fill=GREY)
+
+    return y + bar_h + 50
+
+
+def _wrap_chinese(d: ImageDraw.ImageDraw, text: str, font, avail_w: int,
+                  max_lines: int = 4) -> list[str]:
+    """Per-character word wrap for CJK with hanging punctuation.
+
+    End-of-sentence punctuation (。，？！；：、 etc.) never starts a new line —
+    it gets glued onto the previous line, overhanging the right margin a bit.
+    Truncates with ellipsis if the text doesn't fit within max_lines.
+    """
+    NO_LINE_START = "。，！？；：、）】」』·…—"
+    lines: list[str] = []
+    buf = ""
+    for ch in text:
+        trial = buf + ch
+        if text_w(d, trial, font) <= avail_w:
+            buf = trial
+        else:
+            # Would overflow — but if this char is a no-line-start punctuation,
+            # let it hang on the current line rather than orphan it.
+            if ch in NO_LINE_START and buf:
+                buf = trial
+            else:
+                if buf:
+                    lines.append(buf)
+                buf = ch
+    if buf:
+        lines.append(buf)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        last = lines[-1]
+        while last and text_w(d, last + "…", font) > avail_w:
+            last = last[:-1]
+        lines[-1] = last + "…"
+    return lines
+
+
+def draw_quote(d: ImageDraw.ImageDraw, y_top: int, y_bottom: int,
+               *, x_left: int, x_right: int) -> None:
+    """Book quote centered; attribution right-aligned at the bottom-right."""
+    picked = quotes.pick_for()
+    # tolerate both 3- and 4-tuple (older schema) shapes
+    text = picked[0]
+    author = picked[1] if len(picked) > 1 else ""
+    work = picked[2] if len(picked) > 2 else ""
+    year = picked[3] if len(picked) > 3 else ""
+
+    f_quote = f("kai", 52)
+    f_author = f("kai", 32)
+
+    avail_w = x_right - x_left - 60
+    lines = _wrap_chinese(d, text, f_quote, avail_w, max_lines=3)
+
+    line_h = 72
+    quote_h = line_h * len(lines)
+    attr_gap = 24
+    attr_line_h = 38
+    total_h = quote_h + attr_gap + attr_line_h
+    band_h = y_bottom - y_top
+    start_y = y_top + max(0, (band_h - total_h) // 2)
+    cx = (x_left + x_right) // 2
+
+    # Quote — centered
+    for i, line in enumerate(lines):
+        lw = text_w(d, line, f_quote)
+        d.text((cx - lw // 2, start_y + i * line_h), line, font=f_quote, fill=BLACK)
+
+    # Attribution — right-aligned, author only
+    author_line = f"——  {author}"
+    aw = text_w(d, author_line, f_author)
+    d.text((x_right - aw, start_y + quote_h + attr_gap),
+           author_line, font=f_author, fill=GREY)
+
+
+def draw_notes(d: ImageDraw.ImageDraw, y_top: int, y_bottom: int,
+               *, x_left: int, x_right: int) -> None:
+    """Todo / notes board on the RIGHT half of the band.
+
+    Reads ./todos.txt — edit that file and the card updates within a minute.
+    """
+    items = todos_module.load()
+    if not items:
+        return
+
+    f_title = f("kai", 28)
+    f_item = f("kai", 26)
+    f_item_done = f("kai", 26)
+
+    title = "便  签"
+    title_h = 36
+    item_h = 40
+    avail_w = x_right - x_left
+    max_items = max(0, (y_bottom - y_top - title_h - 16) // item_h)
+    shown = items[:max_items] if max_items else []
+    total_h = title_h + 16 + item_h * len(shown)
+    band_h = y_bottom - y_top
+    start_y = y_top + max(0, (band_h - total_h) // 2)
+
+    # Title with thin underline
+    tw = text_w(d, title, f_title)
+    d.text((x_left, start_y), title, font=f_title, fill=BLACK)
+    d.line([(x_left, start_y + 34), (x_left + tw + 12, start_y + 34)],
+           fill=BLACK, width=1)
+
+    # Items
+    y = start_y + title_h + 12
+    box = 20
+    text_avail = avail_w - box - 14
+    for it in shown:
+        text = it["text"]
+        done = it["done"]
+        bx, by = x_left, y + 4
+        # checkbox
+        d.rectangle([bx, by, bx + box, by + box], outline=BLACK, width=2)
+        if done:
+            d.line([(bx + 5, by + box // 2), (bx + box // 2, by + box - 5)],
+                   fill=BLACK, width=3)
+            d.line([(bx + box // 2, by + box - 5), (bx + box - 3, by + 4)],
+                   fill=BLACK, width=3)
+
+        # text (truncate if too wide for the right column)
+        wrapped = _wrap_chinese(d, text, f_item, text_avail, max_lines=1)
+        text_str = wrapped[0] if wrapped else ""
+        fill = GREY if done else BLACK
+        d.text((bx + box + 12, y), text_str, font=f_item_done if done else f_item,
+               fill=fill)
+        if done and text_str:
+            tw_done = text_w(d, text_str, f_item_done)
+            sy = y + 18
+            d.line([(bx + box + 12, sy), (bx + box + 12 + tw_done, sy)],
+                   fill=GREY, width=2)
+
+        y += item_h
+
+
+def _draw_weather_flanks(d: ImageDraw.ImageDraw, y: int, *, time_left: int, time_right: int):
+    """Weather data on left/right of the big time digits. Labels in Chinese (kai)."""
+    w = weather_api.get_weather()
+    if not w:
+        return
+
+    GAP = 24
+    left_x_end = time_left - GAP
+    right_x_start = time_right + GAP
+
+    f_temp = f("sans_light", 96)
+    f_temp_deg = f("sans_light", 52)
+    f_label = f("kai", 28)         # 中文标签
+    f_label_sm = f("kai", 26)
+    f_cond_zh = f("kai", 40)       # 天气状况
+    f_num = f("sans_light", 28)    # 数字（与中文标签一行）
+
+    # ---------- LEFT: 大温度 + 体感 + 天气状况 ----------
+    temp = w.get("temp")
+    feels = w.get("feels")
+    skycon = w.get("skycon")
+
+    if temp is not None:
+        temp_str = f"{round(temp)}"
+        tw = text_w(d, temp_str, f_temp)
+        tx = left_x_end - text_w(d, "°", f_temp_deg) - 6 - tw
+        d.text((tx, y + 30), temp_str, font=f_temp, fill=BLACK)
+        d.text((tx + tw + 6, y + 50), "°", font=f_temp_deg, fill=BLACK)
+
+    if feels is not None:
+        # "体感  31°"
+        s_zh = "体感  "
+        s_num = f"{round(feels)}°"
+        zw = text_w(d, s_zh, f_label_sm)
+        nw = text_w(d, s_num, f_num)
+        total = zw + nw
+        x0 = left_x_end - total
+        d.text((x0, y + 162), s_zh, font=f_label_sm, fill=GREY)
+        d.text((x0 + zw, y + 158), s_num, font=f_num, fill=GREY)
+
+    cond_zh = weather_api.skycon_zh(skycon or "")
+    if cond_zh:
+        sw = text_w(d, cond_zh, f_cond_zh)
+        d.text((left_x_end - sw, y + 210), cond_zh, font=f_cond_zh, fill=BLACK)
+
+    # ---------- RIGHT: 高低温 · 空气 · 湿度 · 日出日落 ----------
+    items = []
+    if w.get("today_max") is not None and w.get("today_min") is not None:
+        items.append(("最高 ", f"{round(w['today_max'])}°",
+                      " 最低 ", f"{round(w['today_min'])}°"))
+    if w.get("aqi") is not None:
+        items.append(("空气 ", f"{w['aqi']}",
+                      " " + (w.get("aqi_desc") or ""), ""))
+    if w.get("humidity") is not None:
+        items.append(("湿度 ", f"{round(w['humidity'] * 100)}%", "", ""))
+    if w.get("sunrise") and w.get("sunset"):
+        items.append(("日出 ", w["sunrise"],
+                      " 日落 ", w["sunset"]))
+
+    line_h = 50
+    rstart_y = y + 36
+    for i, parts in enumerate(items):
+        ly = rstart_y + i * line_h
+        x = right_x_start
+        for j, seg in enumerate(parts):
+            if not seg:
+                continue
+            # Heuristic: pure ASCII digits/symbols → use f_num; otherwise kai.
+            is_num = all(c.isascii() and (c.isdigit() or c in "°%:.→ ") for c in seg)
+            font_use = f_num if is_num else f_label
+            fill = BLACK if (is_num or j == 0) else GREY
+            d.text((x, ly + (-2 if is_num else 0)), seg, font=font_use, fill=fill)
+            x += text_w(d, seg, font_use)
+
+
+def draw_weather(d: ImageDraw.ImageDraw, y: int) -> int:
+    """Compact weather card: heading + big temp + secondary stats + one-line forecast.
+
+    Notes on fonts: cursive Segoe Script doesn't have CJK glyphs; mix in kai/sans for
+    anything containing Chinese (AQI level, skycon zh, forecast keypoint).
+    """
+    w = weather_api.get_weather()
+    if not w:
+        return y
+
+    f_section_en = f("geo_b", 52)
+    f_loc = f("geo_i", 34)
+    f_temp = f("sans_light", 88)
+    f_temp_deg = f("sans_light", 42)
+    f_cond = f("geo_b", 42)
+    f_cond_zh = f("kai", 34)
+    f_feels = f("geo_i", 30)
+    f_kv = f("geo_b", 28)
+    f_kv_zh = f("kai", 26)
+    f_kp = f("kai", 28)
+
+    # Heading
+    d.text((MARGIN, y), "Weather", font=f_section_en, fill=BLACK)
+    hw = text_w(d, "Weather", f_section_en)
+    loc = f"·  {w.get('location_name', '')}"
+    d.text((MARGIN + hw + 14, y + 12), loc, font=f_loc, fill=GREY)
+    y += 70
+    hrule(d, y, width=1)
+    y += 24
+
+    # Big temp left, condition right
+    temp = w.get("temp")
+    feels = w.get("feels")
+    skycon = w.get("skycon")
+
+    temp_str = f"{round(temp)}" if temp is not None else "—"
+    tw = text_w(d, temp_str, f_temp)
+    px = MARGIN + 20
+    d.text((px, y), temp_str, font=f_temp, fill=BLACK)
+    d.text((px + tw + 6, y + 22), "°", font=f_temp_deg, fill=BLACK)
+    if feels is not None:
+        d.text((px + tw + 60, y + 50), f"feels  {round(feels)}°",
+               font=f_feels, fill=GREY)
+
+    cond_en = weather_api.skycon_en(skycon or "")
+    cond_zh = weather_api.skycon_zh(skycon or "")
+    right_x = W - MARGIN
+    cw = text_w(d, cond_en, f_cond)
+    d.text((right_x - cw, y + 4), cond_en, font=f_cond, fill=BLACK)
+    czw = text_w(d, cond_zh, f_cond_zh)
+    d.text((right_x - czw, y + 56), cond_zh, font=f_cond_zh, fill=GREY)
+
+    y += 110
+
+    # Secondary line: H/L | AQI | humidity | sunrise/sunset — mix fonts to render zh glyph
+    parts = []
+    if w.get("today_max") is not None and w.get("today_min") is not None:
+        parts.append(("en", f"H  {round(w['today_max'])}°   L  {round(w['today_min'])}°"))
+    if w.get("aqi") is not None:
+        aqi_text = f"AQI  {w['aqi']}"
+        parts.append(("en", aqi_text))
+        if w.get("aqi_desc"):
+            parts.append(("zh", w["aqi_desc"]))
+    if w.get("humidity") is not None:
+        parts.append(("en", f"hum  {round(w['humidity'] * 100)}%"))
+    if w.get("sunrise") and w.get("sunset"):
+        parts.append(("en", f"{w['sunrise']} → {w['sunset']}"))
+
+    x = MARGIN + 20
+    sep_w = text_w(d, "  ·  ", f_kv)
+    for i, (kind, s) in enumerate(parts):
+        if i > 0:
+            d.text((x, y), "  ·  ", font=f_kv, fill=GREY)
+            x += sep_w
+        font_use = f_kv if kind == "en" else f_kv_zh
+        d.text((x, y + (2 if kind == "zh" else 0)), s, font=font_use, fill=BLACK)
+        x += text_w(d, s, font_use)
+    y += 50
+
+    # Forecast keypoint
+    kp = w.get("forecast_keypoint")
+    if kp:
+        d.text((MARGIN + 20, y), kp, font=f_kp, fill=GREY)
+        y += 40
+
+    return y
+
+
+def draw_section_title(d: ImageDraw.ImageDraw, y: int, en: str, zh: str) -> int:
+    f_en = f("geo_i", 30)
+    f_zh = f("serif_zh", 84)
+
+    # English caption above
+    d.text((MARGIN, y), en, font=f_en, fill=GREY)
+    # Chinese title
+    d.text((MARGIN, y + 40), zh, font=f_zh, fill=BLACK)
+
+    # Thin rule under title
+    title_w = text_w(d, zh, f_zh)
+    hrule(d, y + 40 + 100, x1=MARGIN, x2=MARGIN + title_w + 80, width=2)
+
+    return y + 40 + 130
+
+
+def draw_todo(d: ImageDraw.ImageDraw, y: int, items: list):
+    f_idx = f("geo_i", 38)
+    f_item = f("serif", 56)
+    f_strike = f("serif", 56)
+
+    line_gap = 92
+    idx_w = 80
+    for i, it in enumerate(items, 1):
+        if isinstance(it, str):
+            text, done = it, False
+        else:
+            text, done = it.get("text", ""), bool(it.get("done"))
+
+        # roman-style index number
+        idx_str = f"{i:02d}"
+        d.text((MARGIN, y + 6), idx_str, font=f_idx, fill=GREY)
+
+        # item text
+        x = MARGIN + idx_w
+        fill = GREY if done else BLACK
+        d.text((x, y), text, font=f_item, fill=fill)
+
+        if done:
+            # strikethrough
+            w = text_w(d, text, f_item)
+            sy = y + 36
+            d.line([(x, sy), (x + w, sy)], fill=GREY, width=2)
+
+        y += line_gap
+
+    return y
+
+
+def draw_clawd(img: Image.Image, d: ImageDraw.ImageDraw, x: int, y: int,
+               size: int = 64, asset_path: Path | None = None) -> tuple[int, int]:
+    """Paste the prepared Clawd pixel-sprite onto the card.
+
+    Clawd is the Claude Code mascot — a small pixel-art creature with two
+    angled eyes and stubby legs. The asset at ``assets/clawd.png`` is an
+    LA-mode (gray + alpha) image, so we use its alpha channel as a paste
+    mask to keep the surrounding card pure white.
+
+    ``size`` is the target *height* in device pixels (width is derived to
+    preserve aspect ratio). NEAREST resampling keeps the pixels crisp on
+    e-ink — bilinear would leave a grey halo that prints muddy.
+
+    Silently no-ops if the asset is missing, so the rest of the card
+    still renders. Returns the (x, y) top-left where the sprite was
+    placed, for caller-side bookkeeping / tests.
+    """
+    if asset_path is None:
+        asset_path = Path(__file__).parent / "assets" / "clawd.png"
+    if not asset_path.exists():
+        return (x, y)
+
+    sprite = Image.open(asset_path)
+    sw, sh = sprite.size
+    # Fit by height; derive width to preserve aspect ratio.
+    scale = size / sh
+    new_w = max(1, int(round(sw * scale)))
+    new_h = max(1, int(round(sh * scale)))
+    sprite = sprite.resize((new_w, new_h), Image.NEAREST)
+
+    if sprite.mode == "LA":
+        l_channel, a_channel = sprite.split()
+    elif sprite.mode == "RGBA":
+        l_channel = sprite.convert("RGB").convert("L")
+        a_channel = sprite.split()[-1]
+    else:
+        l_channel = sprite.convert("L")
+        a_channel = None
+
+    if a_channel is not None:
+        img.paste(l_channel, (x, y), a_channel)
+    else:
+        img.paste(l_channel, (x, y))
+    return (x, y)
+
+
+def draw_footer(d: ImageDraw.ImageDraw, label: str):
+    y = H - 100
+    double_rule(d, y, gap=5, thick=3, thin=1)
+
+    fy = y + 22
+    f_foot = f("geo_i", 32)
+    f_mono = f("mono", 26)
+    left = label
+    right = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+
+    d.text((MARGIN, fy), left, font=f_foot, fill=GREY)
+    rw = text_w(d, right, f_mono)
+    d.text((W - MARGIN - rw, fy + 2), right, font=f_mono, fill=GREY)
+
+    # tiny centered ornament
+    orn = "—   ·   —"
+    f_orn = f("geo_i", 24)
+    ow = text_w(d, orn, f_orn)
+    d.text(((W - ow) // 2, fy + 2), orn, font=f_orn, fill=GREY)
+
+
+def issue_string(now: datetime) -> str:
+    return now.strftime("%y%m%d")
+
+
+def render(payload: dict, out: Path) -> Path:
+    # Apply per-render font overrides (payload.fonts maps logical keys to paths).
+    global _FONT_OVERRIDES
+    _FONT_OVERRIDES = {}
+    fonts_cfg = payload.get("fonts") or {}
+    if isinstance(fonts_cfg, dict):
+        for k, v in fonts_cfg.items():
+            if isinstance(v, str) and v and Path(v).exists():
+                _FONT_OVERRIDES[k] = v
+
+    img = Image.new("L", (W, H), WHITE)
+    d = ImageDraw.Draw(img)
+    global _CURRENT_IMG
+    _CURRENT_IMG = img
+
+    now = datetime.now()
+    issue = payload.get("issue", issue_string(now))
+
+    y = draw_masthead(d, now, issue)
+    y = draw_time_band(d, now, y + 10)
+
+    widget = payload.get("widget", "usage")
+    if widget == "usage":
+        # Anchor usage to the bottom of the card (above footer) so the
+        # middle stays as whitespace breathing room.
+        FOOTER_TOP = H - 100
+        USAGE_HEIGHT_ESTIMATE = 850
+        usage_y = FOOTER_TOP - 30 - USAGE_HEIGHT_ESTIMATE
+        # Don't push above the time band area though
+        usage_y = max(usage_y, y + 40)
+
+        # Book quote centered in the empty band between time and usage.
+        if payload.get("show_quote", True):
+            draw_quote(d, y_top=y + 20, y_bottom=usage_y - 30,
+                       x_left=MARGIN, x_right=W - MARGIN)
+
+        draw_big_usage(d, usage_y,
+                       show_extra=bool(payload.get("show_extra", False)))
+    elif widget == "todo":
+        items = payload.get("items", [])
+        en = payload.get("section_en", "Things to do")
+        zh = payload.get("title", "今 日 待 办")
+        y = draw_section_title(d, y, en, zh)
+        draw_todo(d, y + 10, items)
+    elif widget == "clock":
+        pass
+    else:
+        d.text((MARGIN, y), f"unknown widget: {widget}", font=f("sans", 60), fill=BLACK)
+
+    draw_footer(d, payload.get("footer", "desk-card · likebook K78W"))
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out, "PNG", optimize=True)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", help="inline JSON payload")
+    ap.add_argument("--stdin", action="store_true", help="read JSON from stdin")
+    ap.add_argument("--out", default=str(Path(__file__).parent / "out" / "current.png"))
+    args = ap.parse_args()
+
+    if args.stdin:
+        payload = json.load(sys.stdin)
+    elif args.json:
+        payload = json.loads(args.json)
+    else:
+        payload = {
+            "widget": "usage",
+            "footer": "desk-card · likebook K78W",
+        }
+
+    out = render(payload, Path(args.out))
+    print(out)
+
+
+if __name__ == "__main__":
+    main()
