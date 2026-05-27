@@ -24,20 +24,50 @@ MARGIN = 90
 BLACK, WHITE = 0, 255
 GREY = 90
 
-FONTS = {
-    "sans":       r"C:\Windows\Fonts\msyh.ttc",
-    "sans_bold":  r"C:\Windows\Fonts\msyhbd.ttc",
-    "sans_light": r"C:\Windows\Fonts\msyhl.ttc",
-    "serif":      r"C:\Windows\Fonts\STSONG.TTF",
-    "serif_zh":   r"C:\Windows\Fonts\STZHONGS.TTF",
-    "kai":        r"C:\Windows\Fonts\STKAITI.TTF",
-    # English: single connected script (Segoe Script Bold) for visual consistency
-    "geo":        r"C:\Windows\Fonts\segoescb.ttf",
-    "geo_b":      r"C:\Windows\Fonts\segoescb.ttf",
-    "geo_i":      r"C:\Windows\Fonts\segoescb.ttf",
-    "mono":       r"C:\Windows\Fonts\consola.ttf",
-    "mono_bold":  r"C:\Windows\Fonts\consolab.ttf",
-}
+if sys.platform == "darwin":
+    # macOS：宋体/楷体/Segoe Script 等 Windows 字体我们从 Win 复制到 ~/Library/Fonts/；
+    # 黑体走系统自带的 Hiragino Sans GB；等宽走 Menlo。
+    # .ttc 必须显式指定 index 拿对字重 —— Songti SC Black (idx=0) 不含 〇 (U+3007)，
+    # 用 idx=6 (SC Regular) 才能正常渲染年份；Hiragino idx=0=W3, idx=1=W6。
+    _MAC_USER_FONTS = str(Path.home() / "Library" / "Fonts")
+    _SONGTI = "/System/Library/Fonts/Supplemental/Songti.ttc"
+    _HIRAGINO = "/System/Library/Fonts/Hiragino Sans GB.ttc"
+    _MENLO = "/System/Library/Fonts/Menlo.ttc"
+    FONTS = {
+        "sans":       (_HIRAGINO, 0),       # W3 Regular
+        # sans_bold 故意用 W3 而不是 W6：Hiragino W6 比 Win 端 msyhbd 粗得多，
+        # 会挤占大时钟两侧的天气列空间。Mac 上没有 medium 字重，W3 视觉更接近原排版。
+        "sans_bold":  (_HIRAGINO, 0),
+        "sans_light": "/System/Library/Fonts/STHeiti Light.ttc",
+        "serif":      (_SONGTI, 6),         # SC Regular，含 〇
+        "serif_zh":   (_SONGTI, 6),
+        "kai":        f"{_MAC_USER_FONTS}/STKAITI.TTF",
+        "quote_body": (_SONGTI, 6),
+        "quote_attr": f"{_MAC_USER_FONTS}/STKAITI.TTF",
+        "geo":        f"{_MAC_USER_FONTS}/segoescb.ttf",
+        "geo_b":      f"{_MAC_USER_FONTS}/segoescb.ttf",
+        "geo_i":      f"{_MAC_USER_FONTS}/segoescb.ttf",
+        "mono":       (_MENLO, 0),          # Regular
+        "mono_bold":  (_MENLO, 1),          # Bold
+    }
+else:
+    FONTS = {
+        "sans":       r"C:\Windows\Fonts\msyh.ttc",
+        "sans_bold":  r"C:\Windows\Fonts\msyhbd.ttc",
+        "sans_light": r"C:\Windows\Fonts\msyhl.ttc",
+        "serif":      r"C:\Windows\Fonts\STSONG.TTF",
+        "serif_zh":   r"C:\Windows\Fonts\STZHONGS.TTF",
+        "kai":        r"C:\Windows\Fonts\STKAITI.TTF",
+        # 书摘专用：正文沉稳书页感（华文中宋），署名走手写题字感（楷体小字）
+        "quote_body": r"C:\Windows\Fonts\STZHONGS.TTF",
+        "quote_attr": r"C:\Windows\Fonts\STKAITI.TTF",
+        # English: single connected script (Segoe Script Bold) for visual consistency
+        "geo":        r"C:\Windows\Fonts\segoescb.ttf",
+        "geo_b":      r"C:\Windows\Fonts\segoescb.ttf",
+        "geo_i":      r"C:\Windows\Fonts\segoescb.ttf",
+        "mono":       r"C:\Windows\Fonts\consola.ttf",
+        "mono_bold":  r"C:\Windows\Fonts\consolab.ttf",
+    }
 
 # Per-render font overrides (set by render() when payload has a "fonts" dict).
 _FONT_OVERRIDES: dict[str, str] = {}
@@ -49,6 +79,20 @@ _CURRENT_IMG: Image.Image | None = None
 CN_MONTH = "一二三四五六七八九十"
 CN_NUM = "〇一二三四五六七八九"
 WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
+
+# 农历 / 节气文本中可能出现的简繁差异字。专为 _lunar_line 输出做简体→繁体转换，
+# 不涉及其他界面文本（保持英文 + 简体混排不变）。
+_S2T = str.maketrans({
+    "龙": "龍", "马": "馬", "鸡": "雞", "猪": "豬",      # 生肖
+    "惊": "驚", "蛰": "蟄", "谷": "穀", "满": "滿",      # 节气
+    "种": "種", "处": "處",                              # 节气续
+    "腊": "臘", "闰": "閏",                              # 农历月名
+    "节": "節", "气": "氣", "余": "餘",                  # 其他词
+})
+
+
+def _s2t(s: str) -> str:
+    return s.translate(_S2T)
 
 
 # ---- Pixel-art weather icons (matching Clawd's monochrome shadow-puppet style) ----
@@ -189,14 +233,22 @@ def draw_skycon_icon(d: "ImageDraw.ImageDraw", *, x_right: int, y: int,
 
 
 def f(key: str, size: int) -> ImageFont.FreeTypeFont:
-    """Resolve a font by logical key; checks per-render overrides first."""
-    path = _FONT_OVERRIDES.get(key) or FONTS[key]
-    return ImageFont.truetype(path, size)
+    """Resolve a font by logical key; checks per-render overrides first.
+
+    FONTS / _FONT_OVERRIDES values may be a plain path string or a
+    ``(path, index)`` tuple for .ttc collections where the default index=0
+    sub-font lacks needed glyphs (e.g. macOS Songti SC Black is missing 〇).
+    """
+    entry = _FONT_OVERRIDES.get(key) or FONTS[key]
+    if isinstance(entry, tuple):
+        path, idx = entry
+        return ImageFont.truetype(path, size, index=idx)
+    return ImageFont.truetype(entry, size)
 
 
 def cn_day(n: int) -> str:
     """1..31 → 一/二.../十一/.../三十一."""
-    if n <= 10:
+    if n < 10:
         return CN_NUM[n]
     if n < 20:
         return "十" + (CN_NUM[n - 10] if n > 10 else "")
@@ -263,14 +315,21 @@ def draw_masthead(d: ImageDraw.ImageDraw, now: datetime, issue: str) -> int:
     return bottom_rule_y + 26
 
 
-def draw_time_band(d: ImageDraw.ImageDraw, now: datetime, y: int) -> int:
-    """Massive sans-serif HH:MM centered, with weather flanks on L/R, then Chinese date + lunar."""
+def draw_time_band(d: ImageDraw.ImageDraw, now: datetime, y: int, *,
+                   bake_time: bool = True) -> int:
+    """Massive sans-serif HH:MM centered, with weather flanks on L/R, then Chinese date + lunar.
+
+    If `bake_time` is False, we still compute the time bounding box (so the
+    weather flanks and the date below position correctly) but skip the actual
+    digit drawing — the APK draws the live clock as a TextView overlay.
+    """
     f_time = f("sans_bold", 280)
     time_str = now.strftime("%H:%M")
     tw = text_w(d, time_str, f_time)
     tx = (W - tw) // 2
-    d.text((tx, y), time_str, font=f_time, fill=BLACK)
     tb = d.textbbox((tx, y), time_str, font=f_time)
+    if bake_time:
+        d.text((tx, y), time_str, font=f_time, fill=BLACK)
     time_bottom = tb[3]
 
     # Weather flanks: left and right of the time digits
@@ -288,10 +347,11 @@ def draw_time_band(d: ImageDraw.ImageDraw, now: datetime, y: int) -> int:
     y3 = y2 + 56
     lunar = _lunar_line(now)
     if lunar:
-        f_lunar = f("kai", 32)
+        # 换中宋 + 加大 + 字色加深，e-ink 上更清晰
+        f_lunar = f("serif_zh", 34)
         lspacing = 8
         lw = sum(text_w(d, ch, f_lunar) + lspacing for ch in lunar) - lspacing
-        draw_spaced(d, ((W - lw) // 2, y3), lunar, f_lunar, fill=GREY, spacing=lspacing)
+        draw_spaced(d, ((W - lw) // 2, y3), lunar, f_lunar, fill=50, spacing=lspacing)
         y_rule = y3 + 56
     else:
         y_rule = y2 + 70
@@ -324,10 +384,10 @@ def _lunar_line(now: datetime) -> str:
                 target = datetime(ny, nd[0], nd[1])
                 days = (target.date() - now.date()).days
                 if days >= 0:
-                    parts.append(f"次{nxt} · 余 {days} 日")
+                    parts.append(f"次{nxt} · 余 {cn_day(days)} 日")
             except Exception:
                 pass
-    return "  ·  ".join(parts)
+    return _s2t("  ·  ".join(parts))
 
 
 
@@ -358,16 +418,16 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *, show_extra: bool = False, 
     extra_usage = official.get("extra_usage") or {}
 
     # Section heading
-    f_section_en = f("geo_b", 64)
-    f_plan = f("geo_i", 38)
+    f_section_en = f("geo_b", 62)   # -2
+    f_plan = f("geo_i", 36)         # -2
     en = "Claude  Code  Usage"
     plan_str = f"plan : {plan}"
     d.text((MARGIN, y), en, font=f_section_en, fill=BLACK)
     pw = text_w(d, plan_str, f_plan)
     d.text((W - MARGIN - pw, y + 22), plan_str, font=f_plan, fill=GREY)
-    y += 86
+    y += 76
     hrule(d, y, width=1)
-    y += 40
+    y += 26
 
     # ---- 5h block ----
     y = _draw_usage_row(d, y,
@@ -375,7 +435,7 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *, show_extra: bool = False, 
                         pct=pct_5h,
                         right_lines=_reset_lines(reset_5h, fmt="hm"),
                         extra=f"opus-4-7  ·  {msg_5h} msg (local)")
-    y += 22
+    y += 8
 
     # ---- 7d block ----
     y = _draw_usage_row(d, y,
@@ -383,7 +443,7 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *, show_extra: bool = False, 
                         pct=pct_7d,
                         right_lines=_reset_lines(reset_7d, fmt="dh"),
                         extra=f"{msg_7d} msg total (local)")
-    y += 22
+    y += 8
 
     # extra_usage (overflow $ credits) — hidden by default; opt-in via show_extra
     if show_extra and extra_usage.get("enabled") and extra_usage.get("pct") is not None:
@@ -424,17 +484,17 @@ def _reset_lines(reset_at, *, fmt: str) -> tuple[str, str, str]:
 def _draw_usage_row(d: ImageDraw.ImageDraw, y: int, *, label_en: str,
                     pct, right_lines: tuple, extra: str) -> int:
     """One usage row: label + huge %, 3-line right block, progress bar."""
-    f_label_en = f("geo_b", 52)
-    f_pct = f("geo_b", 58)
-    f_pct_sign = f("geo_b", 34)
-    f_r_top = f("geo_i", 36)
-    f_r_mid = f("geo_b", 48)
-    f_r_bot = f("geo_b", 40)
-    f_extra = f("geo_i", 32)
+    f_label_en = f("geo_b", 50)   # -2
+    f_pct = f("geo_b", 56)        # -2
+    f_pct_sign = f("geo_b", 32)   # -2
+    f_r_top = f("geo_i", 34)      # -2
+    f_r_mid = f("geo_b", 46)      # -2
+    f_r_bot = f("geo_b", 38)      # -2
+    f_extra = f("geo_i", 30)      # -2
 
     # Label row
     d.text((MARGIN, y), label_en, font=f_label_en, fill=BLACK)
-    y += 64
+    y += 56
 
     # Huge percentage (left)
     if pct is None:
@@ -533,8 +593,8 @@ def draw_quote(d: ImageDraw.ImageDraw, y_top: int, y_bottom: int,
     work = picked[2] if len(picked) > 2 else ""
     year = picked[3] if len(picked) > 3 else ""
 
-    f_quote = f("kai", 52)
-    f_author = f("kai", 32)
+    f_quote = f("quote_body", 52)
+    f_author = f("quote_attr", 32)
 
     avail_w = x_right - x_left - 60
     lines = _wrap_chinese(d, text, f_quote, avail_w, max_lines=3)
@@ -631,12 +691,14 @@ def _draw_weather_flanks(d: ImageDraw.ImageDraw, y: int, *, time_left: int, time
     left_x_end = time_left - GAP
     right_x_start = time_right + GAP
 
-    f_temp = f("sans_light", 96)
-    f_temp_deg = f("sans_light", 52)
-    f_label = f("kai", 28)         # 中文标签
-    f_label_sm = f("kai", 26)
-    f_cond_zh = f("kai", 40)       # 天气状况
-    f_num = f("sans_light", 28)    # 数字（与中文标签一行）
+    # E-ink 灰度屏上 sans_light 和 kai 都偏糊；换成华文中宋（笔画自然就实，
+    # 已在书摘验证可接受）+ msyh regular 数字，不靠 fake bold 也能清晰。
+    f_temp = f("sans", 96)              # 主温度 light → regular
+    f_temp_deg = f("sans", 52)
+    f_label = f("serif_zh", 32)         # 中文标签 kai → 中宋, +2
+    f_label_sm = f("serif_zh", 30)      # +2
+    f_cond_zh = f("serif_zh", 48)       # 天气状况 +4 (突出"晴/阴/雨")
+    f_num = f("sans", 32)               # 数字 light → regular, +2
 
     # ---------- LEFT: 大温度 + 体感 + 天气状况 ----------
     temp = w.get("temp")
@@ -650,6 +712,9 @@ def _draw_weather_flanks(d: ImageDraw.ImageDraw, y: int, *, time_left: int, time
         d.text((tx, y + 30), temp_str, font=f_temp, fill=BLACK)
         d.text((tx + tw + 6, y + 50), "°", font=f_temp_deg, fill=BLACK)
 
+    # 天气区灰度专用：GREY=90 在 e-ink 上接近隐形，本块统一加深到 50
+    SOFT = 50
+
     if feels is not None:
         # "体感  31°"
         s_zh = "体感  "
@@ -658,8 +723,8 @@ def _draw_weather_flanks(d: ImageDraw.ImageDraw, y: int, *, time_left: int, time
         nw = text_w(d, s_num, f_num)
         total = zw + nw
         x0 = left_x_end - total
-        d.text((x0, y + 162), s_zh, font=f_label_sm, fill=GREY)
-        d.text((x0 + zw, y + 158), s_num, font=f_num, fill=GREY)
+        d.text((x0, y + 162), s_zh, font=f_label_sm, fill=SOFT)
+        d.text((x0 + zw, y + 158), s_num, font=f_num, fill=SOFT)
 
     cond_zh = weather_api.skycon_zh(skycon or "")
     if cond_zh:
@@ -676,9 +741,11 @@ def _draw_weather_flanks(d: ImageDraw.ImageDraw, y: int, *, time_left: int, time
                       " " + (w.get("aqi_desc") or ""), ""))
     if w.get("humidity") is not None:
         items.append(("湿度 ", f"{round(w['humidity'] * 100)}%", "", ""))
-    if w.get("sunrise") and w.get("sunset"):
-        items.append(("日出 ", w["sunrise"],
-                      " 日落 ", w["sunset"]))
+    # 字号增大后一行放不下"日出 06:30  日落 18:45"，拆两行
+    if w.get("sunrise"):
+        items.append(("日出 ", w["sunrise"], "", ""))
+    if w.get("sunset"):
+        items.append(("日落 ", w["sunset"], "", ""))
 
     line_h = 50
     rstart_y = y + 36
@@ -691,7 +758,7 @@ def _draw_weather_flanks(d: ImageDraw.ImageDraw, y: int, *, time_left: int, time
             # Heuristic: pure ASCII digits/symbols → use f_num; otherwise kai.
             is_num = all(c.isascii() and (c.isdigit() or c in "°%:.→ ") for c in seg)
             font_use = f_num if is_num else f_label
-            fill = BLACK if (is_num or j == 0) else GREY
+            fill = BLACK if (is_num or j == 0) else SOFT
             d.text((x, ly + (-2 if is_num else 0)), seg, font=font_use, fill=fill)
             x += text_w(d, seg, font_use)
 
@@ -923,7 +990,7 @@ def render(payload: dict, out: Path) -> Path:
     issue = payload.get("issue", issue_string(now))
 
     y = draw_masthead(d, now, issue)
-    y = draw_time_band(d, now, y + 10)
+    y = draw_time_band(d, now, y + 10, bake_time=payload.get("bake_time", True))
 
     widget = payload.get("widget", "usage")
     if widget == "usage":

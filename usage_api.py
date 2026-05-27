@@ -2,7 +2,7 @@
 
 Reads the Claude Code OAuth access token from ~/.claude/.credentials.json,
 calls GET https://api.anthropic.com/api/oauth/usage, caches the response
-locally for 5 minutes. No plugin dependency.
+locally for 3 minutes. No plugin dependency.
 
 The token is only ever sent in the Authorization header to api.anthropic.com.
 It is not logged, printed, or written to disk.
@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -24,18 +26,41 @@ API_URL = "https://api.anthropic.com/api/oauth/usage"
 BETA_HEADER = "oauth-2025-04-20"
 USER_AGENT = "desk-card/0.1 (+claude-code statusline data)"
 
-CACHE_TTL_S = 300        # 5 minutes — Anthropic's usage endpoint rate-limits aggressively
+CACHE_TTL_S = 180        # 3 minutes — Anthropic's usage endpoint rate-limits aggressively
 FAIL_TTL_S = 30          # short retry on failure
 RL_TTL_S = 180           # 3 minutes when we get 429 (be polite)
 
 
-def _read_creds() -> dict | None:
-    if not CREDS.exists():
-        return None
+def _read_creds_blob_macos_keychain() -> dict | None:
+    # Claude Code on macOS stores credentials in the user's login Keychain
+    # (service="Claude Code-credentials"), not in the .credentials.json file.
+    # Requires the calling process to run in a context where the login keychain
+    # is unlocked — i.e. a user LaunchAgent, not a plain SSH exec channel.
     try:
-        with open(CREDS, encoding="utf-8") as f:
-            blob = json.load(f)
+        r = subprocess.run(
+            ["/usr/bin/security", "find-generic-password",
+             "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        raw = (r.stdout or "").strip()
+        if not raw:
+            return None
+        return json.loads(raw)
     except Exception:
+        return None
+
+
+def _read_creds() -> dict | None:
+    blob: dict | None = None
+    if sys.platform == "darwin":
+        blob = _read_creds_blob_macos_keychain()
+    if blob is None and CREDS.exists():
+        try:
+            with open(CREDS, encoding="utf-8") as f:
+                blob = json.load(f)
+        except Exception:
+            return None
+    if blob is None:
         return None
     oauth = blob.get("claudeAiOauth") or {}
     token = oauth.get("accessToken")
@@ -97,7 +122,7 @@ def _fetch(access_token: str, timeout: float = 8.0) -> tuple[dict | None, str | 
 
 
 def _normalize(api: dict, creds: dict | None) -> dict:
-    """Anthropic OAuth usage response → flat dict (superset of claude-hud shape)."""
+    """Anthropic OAuth usage response → flat dict."""
     five = api.get("five_hour") or {}
     seven = api.get("seven_day") or {}
     seven_opus = api.get("seven_day_opus") or {}
@@ -152,7 +177,7 @@ def get_usage(force: bool = False) -> dict | None:
     data, err = _fetch(creds["access_token"])
     if err or not data:
         ttl = RL_TTL_S if err == "rate-limited" else FAIL_TTL_S
-        # On failure, surface stale cache rather than nothing
+        # On failure, surface stale cache rather than nothing.
         cached = _load_cache()
         if cached and cached.get("data"):
             _save_cache({"ts": now, "ttl_s": ttl, "data": cached["data"], "stale": True, "error": err})
