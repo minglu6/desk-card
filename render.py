@@ -396,14 +396,37 @@ def cn_year_short(y: int) -> str:
     return "".join(CN_NUM[int(c)] for c in s)
 
 
-def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *, show_extra: bool = False, **_) -> int:
-    """Big primary widget: real Claude Code rate-limit % + reset time, 5h + 7d (+ extra opt-in)."""
-    from datetime import datetime, timezone
+def _draw_usage_section_header(d: ImageDraw.ImageDraw, y: int,
+                               en: str, right_meta: str | None) -> int:
+    """Compact section header: '<Section>' (left) + meta line (right) + hrule."""
+    f_section_en = f("geo_b", 36)   # was 62, then 40
+    f_meta = f("geo_i", 22)         # was 36, then 24
+    d.text((MARGIN, y), en, font=f_section_en, fill=BLACK)
+    if right_meta:
+        rw = text_w(d, right_meta, f_meta)
+        d.text((W - MARGIN - rw, y + 12), right_meta, font=f_meta, fill=GREY)
+    y += 40
+    hrule(d, y, width=1)
+    return y + 10
 
+
+def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *,
+                   show_extra: bool = False,
+                   show_codex: bool = True,
+                   codex_quota_5h: int | None = None,
+                   codex_quota_7d: int | None = None,
+                   **_) -> int:
+    """Compact dual-agent usage widget: Claude Code + Codex CLI.
+
+    Claude rows use the official Anthropic OAuth pct + reset time (with Clawd
+    riding the bar). Codex rows use local ~/.codex/state_5.sqlite token counts
+    against a soft quota — labelled ``(local)`` since OpenAI exposes no
+    account-level usage endpoint."""
+
+    # ---- Claude ----
     official = usage_reader.read_official() or {}
     plan = official.get("plan") or "—"
 
-    # Local message counts as a nice secondary stat
     try:
         local = usage_reader.scan(window_hours=(5, 168))
     except Exception:
@@ -411,41 +434,63 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *, show_extra: bool = False, 
     msg_5h = (local.get(5) or {}).get("messages", 0)
     msg_7d = (local.get(168) or {}).get("messages", 0)
 
-    pct_5h = official.get("five_hour_pct")
-    pct_7d = official.get("seven_day_pct")
-    reset_5h = official.get("five_hour_reset_at")
-    reset_7d = official.get("seven_day_reset_at")
-    extra_usage = official.get("extra_usage") or {}
+    y = _draw_usage_section_header(d, y, "Claude  Code", f"plan : {plan}")
 
-    # Section heading
-    f_section_en = f("geo_b", 62)   # -2
-    f_plan = f("geo_i", 36)         # -2
-    en = "Claude  Code  Usage"
-    plan_str = f"plan : {plan}"
-    d.text((MARGIN, y), en, font=f_section_en, fill=BLACK)
-    pw = text_w(d, plan_str, f_plan)
-    d.text((W - MARGIN - pw, y + 22), plan_str, font=f_plan, fill=GREY)
-    y += 76
-    hrule(d, y, width=1)
-    y += 26
-
-    # ---- 5h block ----
     y = _draw_usage_row(d, y,
                         label_en="5 Hour",
-                        pct=pct_5h,
-                        right_lines=_reset_lines(reset_5h, fmt="hm"),
+                        pct=official.get("five_hour_pct"),
+                        right_lines=_reset_lines(official.get("five_hour_reset_at"), fmt="hm"),
                         extra=f"opus-4-7  ·  {msg_5h} msg (local)")
-    y += 8
 
-    # ---- 7d block ----
     y = _draw_usage_row(d, y,
                         label_en="7 Day",
-                        pct=pct_7d,
-                        right_lines=_reset_lines(reset_7d, fmt="dh"),
+                        pct=official.get("seven_day_pct"),
+                        right_lines=_reset_lines(official.get("seven_day_reset_at"), fmt="dh"),
                         extra=f"{msg_7d} msg total (local)")
-    y += 8
 
-    # extra_usage (overflow $ credits) — hidden by default; opt-in via show_extra
+    # ---- Codex ----
+    if show_codex:
+        codex = usage_reader.read_codex(window_hours=(5, 168),
+                                        quota_5h=codex_quota_5h,
+                                        quota_7d=codex_quota_7d)
+        source = codex.get("source", "none")
+        c5 = codex.get(5) or {}
+        c7 = codex.get(168) or {}
+
+        model = codex.get("model") or "gpt-5"
+        if source == "oauth":
+            codex_plan = codex.get("plan") or "—"
+            header_meta = f"plan : {codex_plan}"
+            right_5h = _reset_lines(c5.get("reset_at"), fmt="hm")
+            right_7d = _reset_lines(c7.get("reset_at"), fmt="dh")
+            extra_5h = f"{model}  ·  chatgpt subscription"
+            extra_7d = "real account-level usage"
+        else:
+            header_meta = "(local · this machine only)"
+            right_5h = _codex_right_lines(c5)
+            right_7d = _codex_right_lines(c7)
+            extra_5h = f"{model}  ·  soft cap {usage_reader.fmt_tokens(c5.get('quota') or 0)} tok"
+            extra_7d = f"soft cap {usage_reader.fmt_tokens(c7.get('quota') or 0)} tok  ·  not authoritative"
+
+        y += 46
+        y = _draw_usage_section_header(d, y, "Codex", header_meta)
+
+        y = _draw_usage_row(d, y,
+                            label_en="5 Hour",
+                            pct=c5.get("pct"),
+                            right_lines=right_5h,
+                            extra=extra_5h,
+                            show_clawd=False)
+
+        y = _draw_usage_row(d, y,
+                            label_en="7 Day",
+                            pct=c7.get("pct"),
+                            right_lines=right_7d,
+                            extra=extra_7d,
+                            show_clawd=False)
+
+    # ---- Extra credits (opt-in, rare) ----
+    extra_usage = official.get("extra_usage") or {}
     if show_extra and extra_usage.get("enabled") and extra_usage.get("pct") is not None:
         used = extra_usage.get("used_credits") or 0
         limit = extra_usage.get("monthly_limit") or 0
@@ -455,13 +500,22 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *, show_extra: bool = False, 
             f"${used:.0f} / ${limit:.0f}",
             f"{cur}",
         )
-        y += 22
+        y += 12
         y = _draw_usage_row(d, y,
                             label_en="Extra  Credits",
                             pct=extra_usage.get("pct"),
                             right_lines=right_lines,
                             extra="overflow / pay-as-you-go")
     return y
+
+
+def _codex_right_lines(c: dict) -> tuple[str, str, str]:
+    """3-line right block for a Codex window: tokens label / token count / thread count."""
+    if not c:
+        return ("tokens", "—", "—")
+    tokens = c.get("tokens") or 0
+    threads = c.get("threads") or 0
+    return ("tokens", usage_reader.fmt_tokens(tokens), f"{threads} threads")
 
 
 def _reset_lines(reset_at, *, fmt: str) -> tuple[str, str, str]:
@@ -482,70 +536,93 @@ def _reset_lines(reset_at, *, fmt: str) -> tuple[str, str, str]:
 
 
 def _draw_usage_row(d: ImageDraw.ImageDraw, y: int, *, label_en: str,
-                    pct, right_lines: tuple, extra: str) -> int:
-    """One usage row: label + huge %, 3-line right block, progress bar."""
-    f_label_en = f("geo_b", 50)   # -2
-    f_pct = f("geo_b", 56)        # -2
-    f_pct_sign = f("geo_b", 32)   # -2
-    f_r_top = f("geo_i", 34)      # -2
-    f_r_mid = f("geo_b", 46)      # -2
-    f_r_bot = f("geo_b", 38)      # -2
-    f_extra = f("geo_i", 30)      # -2
+                    pct, right_lines: tuple, extra: str,
+                    show_clawd: bool = True) -> int:
+    """Compact usage row: label + huge %, 3-line right block, progress bar.
 
-    # Label row
+    Layout (~192 px with Clawd, ~168 px without):
+        [label]                          [r_top]
+        [42 %]                           [r_mid]
+                                         [r_bot]
+        (clawd reserve, optional)
+        [============ bar ============]
+        [extra]
+    """
+    f_label_en = f("geo_b", 30)   # was 50
+    f_pct = f("geo_b", 46)        # was 56
+    f_pct_sign = f("geo_b", 24)   # was 32
+    f_r_top = f("geo_i", 26)      # was 34
+    f_r_mid = f("geo_b", 36)      # was 46
+    f_r_bot = f("geo_b", 28)      # was 38
+    f_extra = f("geo_i", 24)      # was 30
+
+    right_x = W - MARGIN
+    top_s, mid_s, bot_s = right_lines
+
+    # Sub-row 1: label_en (left) + right_top (right, small caption)
     d.text((MARGIN, y), label_en, font=f_label_en, fill=BLACK)
-    y += 56
+    d.text((right_x - text_w(d, top_s, f_r_top), y + 6),
+           top_s, font=f_r_top, fill=GREY)
+    y += 36
 
-    # Huge percentage (left)
+    # Pct normalization
     if pct is None:
         pct_str = "—"
         pct_norm = 0.0
     else:
         pct_str = f"{int(round(pct))}"
         pct_norm = max(0.0, min(1.0, pct / 100.0))
+
+    # Sub-row 2: huge pct (left) + right_mid (right, medium emphasis)
     pw = text_w(d, pct_str, f_pct)
-    px = MARGIN + 20
+    px = MARGIN + 12
     d.text((px, y), pct_str, font=f_pct, fill=BLACK)
     if pct is not None:
-        d.text((px + pw + 6, y + 18), "%", font=f_pct_sign, fill=GREY)
-
-    # Right side: 3 lines, all enlarged
-    right_x = W - MARGIN
-    top_s, mid_s, bot_s = right_lines
-    d.text((right_x - text_w(d, top_s, f_r_top), y - 6),
-           top_s, font=f_r_top, fill=GREY)
-    d.text((right_x - text_w(d, mid_s, f_r_mid), y + 36),
+        d.text((px + pw + 4, y + 14), "%", font=f_pct_sign, fill=GREY)
+    d.text((right_x - text_w(d, mid_s, f_r_mid), y + 2),
            mid_s, font=f_r_mid, fill=BLACK)
-    d.text((right_x - text_w(d, bot_s, f_r_bot), y + 90),
+    y += 46
+
+    # Sub-row 3: right_bot only
+    d.text((right_x - text_w(d, bot_s, f_r_bot), y),
            bot_s, font=f_r_bot, fill=BLACK)
+    y += 22
 
-    y += 140  # below the percentage / right block
-
-    # Reserve space above the bar for Clawd to ride
-    y += 60
+    # Clawd reserve (Claude rows only); Codex rows still get a small gap so
+    # the bar doesn't crowd the right_bot text.
+    y += 26 if show_clawd else 14
 
     # Progress bar
     bar_x1, bar_x2 = MARGIN, W - MARGIN
-    bar_h = 22
-    d.rectangle([bar_x1, y, bar_x2, y + bar_h], outline=BLACK, width=3)
+    bar_h = 16
+    d.rectangle([bar_x1, y, bar_x2, y + bar_h], outline=BLACK, width=2)
     fill_x = bar_x1 + int((bar_x2 - bar_x1) * pct_norm)
-    if fill_x > bar_x1 + 3:
-        d.rectangle([bar_x1 + 3, y + 3, fill_x, y + bar_h - 3], fill=BLACK)
+    if fill_x > bar_x1 + 2:
+        d.rectangle([bar_x1 + 2, y + 2, fill_x, y + bar_h - 2], fill=BLACK)
 
-    # Clawd rides the bar — x = current pct, feet rest on the bar top
-    if _CURRENT_IMG is not None and pct is not None:
-        clawd_h = 56
-        # source sprite is ~236w × 166h
+    if show_clawd and _CURRENT_IMG is not None and pct is not None:
+        # Clawd rides the bar for Claude rows.
+        clawd_h = 34
         clawd_w_est = int(clawd_h * 236 / 166)
         marker_x = bar_x1 + int((bar_x2 - bar_x1) * pct_norm) - clawd_w_est // 2
         marker_x = max(bar_x1, min(bar_x2 - clawd_w_est, marker_x))
-        marker_y = y - clawd_h + 4   # feet overlap top edge of bar by ~4 px
+        marker_y = y - clawd_h + 3
         draw_clawd(_CURRENT_IMG, d, x=marker_x, y=marker_y, size=clawd_h)
+    elif not show_clawd and pct is not None:
+        # Codex rows: simple solid triangle pointer above the bar at the fill edge.
+        tip_x = bar_x1 + int((bar_x2 - bar_x1) * pct_norm)
+        tip_x = max(bar_x1 + 6, min(bar_x2 - 6, tip_x))
+        d.polygon(
+            [(tip_x - 6, y - 9), (tip_x + 6, y - 9), (tip_x, y - 1)],
+            fill=BLACK,
+        )
 
     # Extra small line below the bar
-    d.text((MARGIN + 20, y + bar_h + 8), extra, font=f_extra, fill=GREY)
+    d.text((MARGIN + 12, y + bar_h + 5), extra, font=f_extra, fill=GREY)
 
-    return y + bar_h + 50
+    # Return the y *below* the extra line — extra glyphs (~28 px tall for the
+    # 24 px italic) need clearance, otherwise the next row's label overprints.
+    return y + bar_h + 36
 
 
 def _wrap_chinese(d: ImageDraw.ImageDraw, text: str, font, avail_w: int,
@@ -594,15 +671,15 @@ def draw_quote(d: ImageDraw.ImageDraw, y_top: int, y_bottom: int,
     year = picked[3] if len(picked) > 3 else ""
 
     f_quote = f("quote_body", 52)
-    f_author = f("quote_attr", 32)
+    f_author = f("quote_attr", 40)
 
     avail_w = x_right - x_left - 60
     lines = _wrap_chinese(d, text, f_quote, avail_w, max_lines=3)
 
     line_h = 72
     quote_h = line_h * len(lines)
-    attr_gap = 24
-    attr_line_h = 38
+    attr_gap = 28
+    attr_line_h = 46
     total_h = quote_h + attr_gap + attr_line_h
     band_h = y_bottom - y_top
     start_y = y_top + max(0, (band_h - total_h) // 2)
@@ -613,11 +690,12 @@ def draw_quote(d: ImageDraw.ImageDraw, y_top: int, y_bottom: int,
         lw = text_w(d, line, f_quote)
         d.text((cx - lw // 2, start_y + i * line_h), line, font=f_quote, fill=BLACK)
 
-    # Attribution — right-aligned, author only
+    # Attribution — right-aligned, author only.
+    # e-ink 灰阶屏上 GREY=90 几乎隐形；用 30 比 BLACK 略淡以保层次但仍清晰可读。
     author_line = f"——  {author}"
     aw = text_w(d, author_line, f_author)
     d.text((x_right - aw, start_y + quote_h + attr_gap),
-           author_line, font=f_author, fill=GREY)
+           author_line, font=f_author, fill=30)
 
 
 def draw_notes(d: ImageDraw.ImageDraw, y_top: int, y_bottom: int,
