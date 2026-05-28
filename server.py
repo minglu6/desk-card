@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -31,7 +32,7 @@ ROOT = Path(__file__).parent
 OUT = ROOT / "out" / "current.png"
 RENDER = ROOT / "render.py"
 
-RENDER_INTERVAL_S = 60   # re-render the card every minute
+RENDER_INTERVAL_S = 60  # re-render the card every 1 min — APK draws live time locally
 
 # Windows: hide the brief console window that subprocess.run flashes when
 # spawning child processes from a GUI parent (pythonw). Without this, every
@@ -44,10 +45,23 @@ _NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
 QUIET_START_HOUR = 0     # 00:00 inclusive
 QUIET_END_HOUR = 7       # 07:00 exclusive — first render happens at 07:00
 
+# When render is suppressed (quiet hours OR PC locked), poll this often so we
+# can pick up "unsuppressed" quickly. 30 s means unlocking → fresh PNG within
+# half a minute. CPU/IO cost is negligible.
+SUPPRESSED_CHECK_INTERVAL_S = 30
+
+# Master switch for the "stop rendering when PC is locked" behavior.
+# Flip back to True to re-enable; the underlying _is_pc_locked() detection
+# stays in place so the toggle is one-line.
+SUPPRESS_ON_LOCK = False
+
 # adb auto-rebind: when the Likebook reconnects via USB, we silently re-add
 # `adb reverse tcp:8765 tcp:8765` so the on-device APK can keep reaching us
 # without any manual setup.
-ADB_EXE = r"D:\Program Files\adb-fastboot\adb.exe"
+ADB_EXE = shutil.which("adb") or (
+    r"D:\Program Files\adb-fastboot\adb.exe" if os.name == "nt"
+    else "/opt/homebrew/bin/adb"
+)
 ADB_WATCH_INTERVAL_S = 15
 
 app = Flask(__name__)
@@ -60,14 +74,20 @@ def health():
 
 @app.get("/etag.json")
 def etag():
+    # now_ms is the authoritative wall clock — the Likebook K78W's onboard
+    # RTC is dead/unsynced (sticks at 2013-01-20) so the APK uses this to
+    # offset its local clock for the live time overlay.
+    response = {"now_ms": int(time.time() * 1000)}
     if not OUT.exists():
-        return jsonify({"etag": "0", "exists": False}), 200
-    st = OUT.stat()
-    return jsonify({
-        "etag": str(st.st_mtime_ns),
-        "size": st.st_size,
-        "exists": True,
-    })
+        response.update({"etag": "0", "exists": False})
+    else:
+        st = OUT.stat()
+        response.update({
+            "etag": str(st.st_mtime_ns),
+            "size": st.st_size,
+            "exists": True,
+        })
+    return jsonify(response)
 
 
 @app.get("/current.png")
@@ -94,10 +114,10 @@ def do_render():
 
 
 def _render_once() -> bool:
-    """Invoke render.py with no payload (uses defaults). True if successful."""
+    """Invoke render.py with bake_time=False — APK draws live clock as overlay."""
     try:
         proc = subprocess.run(
-            [sys.executable, str(RENDER)],
+            [sys.executable, str(RENDER), "--json", '{"bake_time": false}'],
             capture_output=True, text=True, timeout=30,
             creationflags=_NO_WINDOW,
         )
@@ -115,17 +135,89 @@ def _is_quiet_hours() -> bool:
     return h >= QUIET_START_HOUR or h < QUIET_END_HOUR
 
 
-def _render_loop():
-    """Background loop that re-renders the card on a fixed interval.
+def _is_pc_locked() -> bool:
+    """True when the Windows workstation is at the lock screen.
 
-    Quiet between QUIET_START_HOUR and QUIET_END_HOUR — the e-ink display
-    keeps showing the last frame so the user wakes up to whatever was
-    drawn at midnight; no API calls happen overnight.
+    Reads `WTSINFOEX_LEVEL1_W.SessionFlags` via WTSQuerySessionInformation.
+    On Windows 10/11 (verified empirically by probing lock/unlock transitions
+    on a real user session): the constant `WTS_SESSIONSTATE_LOCK = 0` holds.
+      SessionFlags == 0  → LOCKED
+      SessionFlags == 1  → UNLOCKED
+    (Microsoft docs warn of an inversion on Windows 7 SP1+, but in practice
+    Win 10/11 stayed with the original LOCK=0 semantics. If you ever observe
+    the opposite on a different Windows build, flip the comparison below.)
+
+    This is the same data Windows itself uses to fire WTS_SESSION_LOCK
+    notifications. It works regardless of whether LogonUI/LockApp processes
+    are running, and regardless of input-desktop swaps — both of which
+    earlier attempts (OpenInputDesktop name check, tasklist LogonUI.exe
+    detection) failed at, because Win 8+ LockApp does NOT swap the input
+    desktop and LogonUI.exe is not running while merely locked.
+
+    Returns False on any non-Windows OS so callers degrade gracefully.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        wts = ctypes.windll.Wtsapi32
+        WTS_CURRENT_SERVER_HANDLE = 0
+        WTS_CURRENT_SESSION = 0xFFFFFFFF  # -1 cast to DWORD: current process's session
+        WTSSessionInfoEx = 25
+
+        wts.WTSQuerySessionInformationW.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD),
+        ]
+        wts.WTSQuerySessionInformationW.restype = wintypes.BOOL
+        wts.WTSFreeMemory.argtypes = [ctypes.c_void_p]
+
+        buf = ctypes.c_void_p()
+        size = wintypes.DWORD(0)
+        ok = wts.WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx,
+            ctypes.byref(buf), ctypes.byref(size),
+        )
+        if not ok or not buf.value:
+            return False
+        try:
+            # WTSINFOEX = { DWORD Level; UNION Data; }
+            # The union contains LARGE_INTEGER fields → 8-byte aligned, so a
+            # 4-byte padding follows Level. Field offsets from buf start:
+            #   +0  Level (DWORD)
+            #   +4..7  padding
+            #   +8  SessionId (DWORD)
+            #   +12 SessionState (WTS_CONNECTSTATE_CLASS)
+            #   +16 SessionFlags (LONG)  ← lock/unlock indicator
+            flags = ctypes.c_long.from_address(buf.value + 16).value
+            return flags == 0
+        finally:
+            wts.WTSFreeMemory(buf)
+    except Exception:
+        return False
+
+
+def _render_loop():
+    """Background loop that re-renders the card aligned to a 3-min boundary.
+
+    Render is suppressed in two cases:
+      - Quiet hours [QUIET_START_HOUR, QUIET_END_HOUR) — user is asleep
+      - PC is locked — user can't see the screen anyway
+
+    During suppression we sleep SUPPRESSED_CHECK_INTERVAL_S (30s) instead of
+    aligning to the 3-min boundary, so the moment the user wakes/unlocks we
+    pick it up within 30 s and immediately render. POST /render is never
+    suppressed; only this background loop is.
     """
     while True:
-        if not _is_quiet_hours():
+        locked = SUPPRESS_ON_LOCK and _is_pc_locked()
+        if not (_is_quiet_hours() or locked):
             _render_once()
-        time.sleep(RENDER_INTERVAL_S)
+            sleep_s = RENDER_INTERVAL_S - (time.time() % RENDER_INTERVAL_S)
+        else:
+            sleep_s = SUPPRESSED_CHECK_INTERVAL_S
+        time.sleep(sleep_s)
 
 
 def _adb_watchdog():
