@@ -425,7 +425,6 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *,
 
     # ---- Claude ----
     official = usage_reader.read_official() or {}
-    plan = official.get("plan") or "—"
 
     try:
         local = usage_reader.scan(window_hours=(5, 168))
@@ -434,7 +433,7 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *,
     msg_5h = (local.get(5) or {}).get("messages", 0)
     msg_7d = (local.get(168) or {}).get("messages", 0)
 
-    y = _draw_usage_section_header(d, y, "Claude  Code", f"plan : {plan}")
+    y = _draw_usage_section_header(d, y, "Claude  Code", None)
 
     y = _draw_usage_row(d, y,
                         label_en="5 Hour",
@@ -459,8 +458,7 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *,
 
         model = codex.get("model") or "gpt-5"
         if source == "oauth":
-            codex_plan = codex.get("plan") or "—"
-            header_meta = f"plan : {codex_plan}"
+            header_meta = None
             right_5h = _reset_lines(c5.get("reset_at"), fmt="hm")
             right_7d = _reset_lines(c7.get("reset_at"), fmt="dh")
             extra_5h = f"{model}  ·  chatgpt subscription"

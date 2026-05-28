@@ -1,20 +1,17 @@
-"""Generate a Clawd sprite — ears protrude from the SIDES at the EYE row.
+"""Generate a Clawd sprite — ears protrude from the SIDES, ONE ROW BELOW the eyes.
 
-KEY USER INSIGHT: "耳朵应该是和眼睛在一行的"
-  → The ears are NOT on top of the body. They're at the SAME vertical row
-    as the eyes, sticking OUTWARD from the left and right sides of the
-    body. The body's TOP is flat and narrower than the eye row.
+KEY USER INSIGHT (2026-05-25 revision): "把两边的耳朵往下移动一行"
+  → Ears remain at the SIDES (not on top of the head), but the whole ear
+    cluster is shifted DOWN BY ONE ROW. The top ear row now overlaps the
+    bottom eye row; the bottom ear row sits one cell below the eyes,
+    where the body would normally be.
 
 Geometry:
-  - Body proper is 14 cells wide (cols 1-14)
-  - At the EYE ROW, the figure widens to 16 cells — the extra cells at
-    cols 0-1 and 14-15 are the EARS sticking out sideways
-  - Eyes (transparent holes) at cols 4-5 and 10-11, inside the body
+  - Body proper is 14 cells wide (cols 2-15)
+  - Eye row (row 2): eye holes only, NO ears
+  - Ear rows (rows 3-4): ears protrude 2 cells (cols 0-1 and 16-17);
+    row 3 still has the eye holes carved out, row 4 has solid body underneath
   - 4 stubby black legs at the bottom
-
-This puts the figure's WIDEST POINT at the eye line, with the head
-narrowing above and the body narrowing below — exactly like the user's
-reference image #2.
 """
 from pathlib import Path
 from PIL import Image, ImageDraw
@@ -25,10 +22,10 @@ from PIL import Image, ImageDraw
 GRID = [
     "..##############..",  # 0  body top (14 wide, cols 2-15) in 18-col grid
     "..##############..",  # 1
-    "#####..####..#####",  # 2  EAR + EYE ROW: ears protrude 2 cells beyond body
-    "#####..####..#####",  # 3  (cols 0-1 and 16-17)
-    "..##############..",  # 4  body narrows back to 14 wide
-    "..##############..",  # 5
+    "..###..####..###..",  # 2  EYE ROW: eye holes, NO ears
+    "#####..####..#####",  # 3  EAR + EYE: ears protrude 2 cells (cols 0-1 / 16-17)
+    "##################",  # 4  EAR + BODY: ears continue, body fills behind
+    "..##############..",  # 5  body narrows back to 14 wide
     "..##############..",  # 6
     "..##############..",  # 7
     "..##############..",  # 8  body bottom

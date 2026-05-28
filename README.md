@@ -38,7 +38,7 @@ render.py (Pillow)                  com.desk.card APK
 | `render.py` | 主渲染脚本，1404×1872 PNG，PIL 单文件 |
 | `server.py` | Flask + 后台 render loop + adb watchdog，开机自启入口 |
 | `usage_api.py` | Anthropic OAuth `/api/oauth/usage` 直连 + 5min cache |
-| `usage_reader.py` | usage_api → claude-hud cache 兜底链 |
+| `usage_reader.py` | 调用 usage_api + 扫描会话 JSONL 聚合 token 使用 |
 | `weather_api.py` | 彩云天气 API + 1h cache |
 | `quotes.py` | 50+ 条编程 / AI 冷知识，每 2h 轮换 |
 | `assets/make_clawd.py` | Clawd 像素吉祥物生成器 |

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#FFFFFF"
@@ -11,6 +12,19 @@
         android:layout_height="match_parent"
         android:scaleType="fitCenter"
         android:contentDescription="@null" />
+
+    <!-- Live clock overlay. Position + size are added programmatically in
+         MainActivity to match the pixel coords PIL would draw at: x=316, y=194,
+         box 772×300. Background painted opaque white so it always covers
+         whatever (or nothing) the server rendered underneath. -->
+    <TextView
+        android:id="@+id/time_overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textColor="#000000"
+        android:background="#FFFFFF"
+        android:includeFontPadding="false"
+        android:text="" />
 
     <TextView
         android:id="@+id/status"
