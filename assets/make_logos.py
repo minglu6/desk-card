@@ -87,7 +87,7 @@ def extract_codex_hires(src, out_name, T=55, pad=0.74):
 
 
 print("Claude (抠图 sunburst):")
-extract(OUT_DIR / "claude_src.png", "claude_logo.png", fg="light", thresh=185, r_frac=0.42, pad=0.90)
+extract(OUT_DIR / "claude_src.png", "claude_logo.png", fg="light", thresh=185, r_frac=0.42, pad=0.71)
 print("Codex (高清原图色差抠图 + >_ 镂空):")
 extract_codex_hires(OUT_DIR / "codex_src.png", "codex_logo.png")
 print("done")
