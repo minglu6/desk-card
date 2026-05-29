@@ -204,7 +204,10 @@ def read_codex(window_hours=(5, 168),
     # ---- OAuth (authoritative) ----
     if prefer_oauth:
         oauth = codex_api.get_usage()
-        if oauth:
+        # wham/usage 偶尔返回 200 但 rate_limit=null（pct 全 None，无有效限额数据）；
+        # 此时不当作 OAuth 成功，继续回退本地 sqlite，避免卡片 Codex 用量显示空白。
+        if oauth and (oauth.get("five_hour_pct") is not None
+                      or oauth.get("seven_day_pct") is not None):
             out["source"] = "oauth"
             out["plan"] = oauth.get("plan")
             for h in window_hours:

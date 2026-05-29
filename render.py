@@ -23,6 +23,7 @@ W, H = 1404, 1872
 MARGIN = 90
 BLACK, WHITE = 0, 255
 GREY = 90
+CHIP_BG = 0xD8        # 浅灰 code-chip 底色（GitHub inline-code 风）；e-ink 上配黑描边保边界
 
 if sys.platform == "darwin":
     # macOS：宋体/楷体/Segoe Script 等 Windows 字体我们从 Win 复制到 ~/Library/Fonts/；
@@ -319,9 +320,12 @@ def draw_time_band(d: ImageDraw.ImageDraw, now: datetime, y: int, *,
                    bake_time: bool = True) -> int:
     """Massive sans-serif HH:MM centered, with weather flanks on L/R, then Chinese date + lunar.
 
-    If `bake_time` is False, we still compute the time bounding box (so the
-    weather flanks and the date below position correctly) but skip the actual
-    digit drawing — the APK draws the live clock as a TextView overlay.
+    `y` must stay 194 to match the APK's hard-coded clock overlay — it can't be
+    moved up without rebuilding the APK, so removing the masthead just leaves
+    the 0–194 strip above the clock blank. If `bake_time` is False we still
+    compute the time bbox (so the weather flanks + date below position
+    correctly) but skip drawing the digits — the APK paints the live clock as a
+    TextView overlay there.
     """
     f_time = f("sans_bold", 280)
     time_str = now.strftime("%H:%M")
@@ -335,8 +339,9 @@ def draw_time_band(d: ImageDraw.ImageDraw, now: datetime, y: int, *,
     # Weather flanks: left and right of the time digits
     _draw_weather_flanks(d, y, time_left=tb[0], time_right=tb[2])
 
-    # Gregorian Chinese date
-    y2 = time_bottom + 38
+    # 中文日期在时钟下方。y2 ≥ 500 让它落在 APK 时钟 overlay 底边（y=494）之下，
+    # 否则会被 overlay 的白底盖住。
+    y2 = max(time_bottom + 38, 500)
     date_text = f"二〇{cn_year_short(now.year)} 年 {cn_month(now.month)} {cn_day(now.day)} 日 · 星期{WEEKDAYS[now.weekday()]}"
     f_date = f("serif_zh", 38)
     spacing = 10
@@ -397,15 +402,52 @@ def cn_year_short(y: int) -> str:
 
 
 def _draw_usage_section_header(d: ImageDraw.ImageDraw, y: int,
-                               en: str, right_meta: str | None) -> int:
-    """Compact section header: '<Section>' (left) + meta line (right) + hrule."""
-    f_section_en = f("geo_b", 36)   # was 62, then 40
-    f_meta = f("geo_i", 22)         # was 36, then 24
-    d.text((MARGIN, y), en, font=f_section_en, fill=BLACK)
+                               en: str, right_meta: str | None,
+                               logo_key: str | None = None) -> int:
+    """Section header: [logo] + name as a mono "code chip" (left) + meta (right) + hrule.
+
+    Name is set in mono_bold inside a light-grey rounded chip (GitHub inline-code
+    look), preceded by the agent's app logo when ``logo_key`` is given.
+    """
+    f_chip = f("mono_bold", 28)
+    row_h = 92           # 行加高以容纳放大后的 logo（约原 2 倍）
+    logo_sz = 88         # logo ~2x（原 48）
+    x = MARGIN
+
+    # Agent app-logo, square, vertically centered in the (taller) row.
+    if logo_key and _CURRENT_IMG is not None:
+        ly = y + (row_h - logo_sz) // 2
+        lw = draw_logo(_CURRENT_IMG, x, ly, logo_sz, logo_key)
+        if lw:
+            x += lw + 18
+
+    # Section name as a mono code-chip: light-grey rounded bg + thin black edge
+    # (e-ink can't render the grey fill reliably alone) + black bold text.
+    asc, desc = f_chip.getmetrics()
+    pad_x, pad_y = 16, 8
+    chip_h = asc + desc + pad_y * 2
+    chip_y = y + (row_h - chip_h) // 2
+    tw = text_w(d, en, f_chip)
+    d.rounded_rectangle([x, chip_y, x + tw + pad_x * 2, chip_y + chip_h],
+                        radius=12, fill=CHIP_BG, outline=BLACK, width=1)
+    d.text((x + pad_x, chip_y + pad_y), en, font=f_chip, fill=BLACK)
+
+    # plan（max/plus/pro）紧跟 chip 右侧、放大、垂直居中，比原来右上角小灰字醒目；
+    # 长说明（如 codex 的 "(local · …)" 标注）仍放右上角小字，避免大字挤占整行。
     if right_meta:
-        rw = text_w(d, right_meta, f_meta)
-        d.text((W - MARGIN - rw, y + 12), right_meta, font=f_meta, fill=GREY)
-    y += 40
+        if len(right_meta) <= 6 and " " not in right_meta:
+            f_plan = f("mono_bold", 32)
+            chip_x2 = x + tw + pad_x * 2
+            ma, md = f_plan.getmetrics()
+            d.text((chip_x2 + 18, y + (row_h - (ma + md)) // 2),
+                   right_meta, font=f_plan, fill=50)
+        else:
+            f_meta = f("mono", 20)
+            rw = text_w(d, right_meta, f_meta)
+            d.text((W - MARGIN - rw, y + (row_h - 22) // 2 + 2),
+                   right_meta, font=f_meta, fill=GREY)
+
+    y += row_h
     hrule(d, y, width=1)
     return y + 10
 
@@ -434,16 +476,16 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *,
     msg_5h = (local.get(5) or {}).get("messages", 0)
     msg_7d = (local.get(168) or {}).get("messages", 0)
 
-    y = _draw_usage_section_header(d, y, "Claude  Code", plan)
+    y = _draw_usage_section_header(d, y, "Claude Code", plan, logo_key="claude")
 
     y = _draw_usage_row(d, y,
-                        label_en="5 Hour",
+                        label_en="Current Session",
                         pct=official.get("five_hour_pct"),
                         right_lines=_reset_lines(official.get("five_hour_reset_at"), fmt="hm"),
-                        extra=f"opus-4-7  ·  {msg_5h} msg (local)")
+                        extra=f"{msg_5h} msg (local)")
 
     y = _draw_usage_row(d, y,
-                        label_en="7 Day",
+                        label_en="Weekly Limits",
                         pct=official.get("seven_day_pct"),
                         right_lines=_reset_lines(official.get("seven_day_reset_at"), fmt="dh"),
                         extra=f"{msg_7d} msg total (local)")
@@ -472,17 +514,17 @@ def draw_big_usage(d: ImageDraw.ImageDraw, y: int, *,
             extra_7d = f"soft cap {usage_reader.fmt_tokens(c7.get('quota') or 0)} tok  ·  not authoritative"
 
         y += 46
-        y = _draw_usage_section_header(d, y, "Codex", header_meta)
+        y = _draw_usage_section_header(d, y, "Codex", header_meta, logo_key="codex")
 
         y = _draw_usage_row(d, y,
-                            label_en="5 Hour",
+                            label_en="Current Session",
                             pct=c5.get("pct"),
                             right_lines=right_5h,
                             extra=extra_5h,
                             show_clawd=False)
 
         y = _draw_usage_row(d, y,
-                            label_en="7 Day",
+                            label_en="Weekly Limits",
                             pct=c7.get("pct"),
                             right_lines=right_7d,
                             extra=extra_7d,
@@ -547,13 +589,14 @@ def _draw_usage_row(d: ImageDraw.ImageDraw, y: int, *, label_en: str,
         [============ bar ============]
         [extra]
     """
-    f_label_en = f("geo_b", 30)   # was 50
-    f_pct = f("geo_b", 46)        # was 56
-    f_pct_sign = f("geo_b", 24)   # was 32
-    f_r_top = f("geo_i", 26)      # was 34
-    f_r_mid = f("geo_b", 36)      # was 46
-    f_r_bot = f("geo_b", 28)      # was 38
-    f_extra = f("geo_i", 24)      # was 30
+    # 用量区英文/数字统一走等宽 mono（Menlo）—— 比 Segoe Script 花体好辨认。
+    f_label_en = f("mono_bold", 27)   # was geo_b 30
+    f_pct = f("mono_bold", 46)        # 大百分比数字
+    f_pct_sign = f("mono_bold", 22)   # was 32
+    f_r_top = f("mono", 23)           # "resets at" caption
+    f_r_mid = f("mono_bold", 33)      # 时间数字 14:20 / Wed 19:00
+    f_r_bot = f("mono", 25)           # "in 4h 23m"
+    f_extra = f("mono", 22)           # "380 msg (local)" caption
 
     right_x = W - MARGIN
     top_s, mid_s, bot_s = right_lines
@@ -669,18 +712,27 @@ def draw_quote(d: ImageDraw.ImageDraw, y_top: int, y_bottom: int,
     work = picked[2] if len(picked) > 2 else ""
     year = picked[3] if len(picked) > 3 else ""
 
-    f_quote = f("quote_body", 52)
-    f_author = f("quote_attr", 40)
-
     avail_w = x_right - x_left - 60
-    lines = _wrap_chinese(d, text, f_quote, avail_w, max_lines=3)
-
-    line_h = 72
-    quote_h = line_h * len(lines)
-    attr_gap = 28
-    attr_line_h = 46
-    total_h = quote_h + attr_gap + attr_line_h
     band_h = y_bottom - y_top
+
+    # 自适应字号：从大到小挑能放进书摘带的最大字号 —— 短句用大字醒目，长句自动缩小
+    # 正好塞进带内、不撞下方用量区；版式各项比例随字号同步缩放，始终协调。
+    f_quote = f_author = None
+    line_h = attr_gap = attr_line_h = 0
+    lines: list[str] = []
+    for q_size in (56, 52, 48, 44, 40, 36):
+        f_quote = f("quote_body", q_size)
+        f_author = f("quote_attr", round(q_size * 0.78))
+        line_h = round(q_size * 1.32)
+        attr_gap = round(q_size * 0.50)
+        attr_line_h = round(q_size * 0.85)
+        lines = _wrap_chinese(d, text, f_quote, avail_w, max_lines=2)
+        total_h = line_h * len(lines) + attr_gap + attr_line_h
+        if total_h <= band_h:
+            break
+
+    quote_h = line_h * len(lines)
+    total_h = quote_h + attr_gap + attr_line_h
     start_y = y_top + max(0, (band_h - total_h) // 2)
     cx = (x_left + x_right) // 2
 
@@ -1054,6 +1106,35 @@ def draw_clawd(img: Image.Image, d: ImageDraw.ImageDraw, x: int, y: int,
     return (x, y)
 
 
+_LOGO_FILES = {"claude": "claude_logo.png", "codex": "codex_logo.png"}
+
+
+def draw_logo(img: Image.Image, x: int, y: int, size: int, key: str) -> int:
+    """Paste a prepared grayscale app-logo (LA mode) fit by height; return its
+    drawn width (0 if missing) for caller layout. LANCZOS keeps the icon curves
+    smooth on e-ink (Clawd uses NEAREST because it's pixel art; logos aren't)."""
+    asset = Path(__file__).parent / "assets" / _LOGO_FILES.get(key, "")
+    if not key or not asset.exists():
+        return 0
+    logo = Image.open(asset)
+    sw, sh = logo.size
+    scale = size / sh
+    nw, nh = max(1, round(sw * scale)), max(1, round(sh * scale))
+    logo = logo.resize((nw, nh), Image.LANCZOS)
+    if logo.mode == "LA":
+        l_channel, a_channel = logo.split()
+    elif logo.mode == "RGBA":
+        l_channel = logo.convert("RGB").convert("L")
+        a_channel = logo.split()[-1]
+    else:
+        l_channel, a_channel = logo.convert("L"), None
+    if a_channel is not None:
+        img.paste(l_channel, (x, y), a_channel)
+    else:
+        img.paste(l_channel, (x, y))
+    return nw
+
+
 def draw_footer(d: ImageDraw.ImageDraw, label: str):
     y = H - 100
     double_rule(d, y, gap=5, thick=3, thin=1)
@@ -1097,15 +1178,18 @@ def render(payload: dict, out: Path) -> Path:
     now = datetime.now()
     issue = payload.get("issue", issue_string(now))
 
-    y = draw_masthead(d, now, issue)
-    y = draw_time_band(d, now, y + 10, bake_time=payload.get("bake_time", True))
+    # 顶部 Desk·Card 报头（占 0–184）—— 用户权衡后决定加回，正好填满时钟上方、不留白。
+    draw_masthead(d, now, issue)
+    # 时钟数字固定从 y=194 起笔，对齐 APK 端硬编码的时钟 overlay (316,194,772×300)；
+    # masthead 全在 y<194 与 overlay 不冲突。中文日期 + 农历仍在时钟下方。
+    y = draw_time_band(d, now, 194, bake_time=payload.get("bake_time", True))
 
     widget = payload.get("widget", "usage")
     if widget == "usage":
         # Anchor usage to the bottom of the card (above footer) so the
         # middle stays as whitespace breathing room.
         FOOTER_TOP = H - 100
-        USAGE_HEIGHT_ESTIMATE = 850
+        USAGE_HEIGHT_ESTIMATE = 945   # +95：两个 section header 放大 logo 后各加高 ~44
         usage_y = FOOTER_TOP - 30 - USAGE_HEIGHT_ESTIMATE
         # Don't push above the time band area though
         usage_y = max(usage_y, y + 40)
