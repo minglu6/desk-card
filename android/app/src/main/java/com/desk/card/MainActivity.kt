@@ -27,7 +27,7 @@ import kotlin.concurrent.thread
  * Desk-card 设备端：全屏显示服务端渲染的 PNG，并在固定位置叠加本地时钟。
  *
  * 时钟用 TextView overlay 本地绘制（不烤进服务端图），位置/尺寸硬编码对齐服务端
- * PIL 绘制区：left=316 top=194 box 772×300、字号 280px。服务端图每分钟变化的只有
+ * PIL 绘制区：left=316 top=64 box 772×300、字号 280px。服务端图每分钟变化的只有
  * 慢数据，时钟由本地每分钟对齐刷新，并用 /etag.json 的 now_ms 校正设备时钟偏移
  * （K78W 的 RTC 已坏）。明文重建自反编译结果（原 MainActivity.kt 被 Esafenet 加密）。
  */
@@ -35,7 +35,7 @@ class MainActivity : Activity() {
 
     companion object {
         const val TIME_DRAW_LEFT = 316
-        const val TIME_DRAW_TOP = 194
+        const val TIME_DRAW_TOP = 64
         const val TIME_BOX_WIDTH = 772
         const val TIME_BOX_HEIGHT = 300
         const val TIME_FONT_PX = 280f

@@ -339,9 +339,9 @@ def draw_time_band(d: ImageDraw.ImageDraw, now: datetime, y: int, *,
     # Weather flanks: left and right of the time digits
     _draw_weather_flanks(d, y, time_left=tb[0], time_right=tb[2])
 
-    # 中文日期在时钟下方。y2 ≥ 500 让它落在 APK 时钟 overlay 底边（y=494）之下，
-    # 否则会被 overlay 的白底盖住。
-    y2 = max(time_bottom + 38, 500)
+    # 中文日期在时钟下方。下限 = 时钟起笔 y + overlay 盒高(300) + 余量，确保落在
+    # APK 时钟 overlay 底边之下、不被白底盖住。
+    y2 = max(time_bottom + 38, y + 308)
     date_text = f"二〇{cn_year_short(now.year)} 年 {cn_month(now.month)} {cn_day(now.day)} 日 · 星期{WEEKDAYS[now.weekday()]}"
     f_date = f("serif_zh", 38)
     spacing = 10
@@ -1176,13 +1176,11 @@ def render(payload: dict, out: Path) -> Path:
     _CURRENT_IMG = img
 
     now = datetime.now()
-    issue = payload.get("issue", issue_string(now))
 
-    # 顶部 Desk·Card 报头（占 0–184）—— 用户权衡后决定加回，正好填满时钟上方、不留白。
-    draw_masthead(d, now, issue)
-    # 时钟数字固定从 y=194 起笔，对齐 APK 端硬编码的时钟 overlay (316,194,772×300)；
-    # masthead 全在 y<194 与 overlay 不冲突。中文日期 + 农历仍在时钟下方。
-    y = draw_time_band(d, now, 194, bake_time=payload.get("bake_time", True))
+    # 时钟贴顶：删掉 Desk·Card 报头，时钟成为最上元素、从 y=64 起笔（顶部仅留正常边距）。
+    # 64 必须与 APK MainActivity.TIME_DRAW_TOP 一致——APK 时钟 overlay 硬编码该坐标，
+    # 白底覆盖 (316,64)→(1088,364)；服务端图把日期农历/书摘排到 364 之下避让。
+    y = draw_time_band(d, now, 64, bake_time=payload.get("bake_time", True))
 
     widget = payload.get("widget", "usage")
     if widget == "usage":
