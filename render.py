@@ -233,6 +233,64 @@ def draw_skycon_icon(d: "ImageDraw.ImageDraw", *, x_right: int, y: int,
     return icon_w
 
 
+def draw_wx_icon(d: ImageDraw.ImageDraw, cx: float, cy: float, size: int, kind: str,
+                 fill: int = BLACK) -> None:
+    """矢量天气图标（圆润实心黑剪影，比像素网格在 e-ink 上清晰好看）。
+    (cx, cy) 为图标中心、size 为外接边长。kind ∈ SUN/CLOUD/SUN_CLOUD/RAIN/SNOW/HAZE。"""
+    import math
+    s = size
+    lw = max(3, round(s * 0.07))
+
+    def sun(scx, scy, r, rays=True):
+        d.ellipse([scx - r, scy - r, scx + r, scy + r], fill=fill)
+        if rays:
+            for i in range(8):
+                a = i * math.pi / 4
+                d.line([scx + math.cos(a) * (r + r * 0.45), scy + math.sin(a) * (r + r * 0.45),
+                        scx + math.cos(a) * (r + r * 1.05), scy + math.sin(a) * (r + r * 1.05)],
+                       fill=fill, width=lw)
+
+    def cloud(ccx, ccy, cw):
+        r_mid, r_left, r_right = cw * 0.30, cw * 0.21, cw * 0.24
+        mid = (ccx + cw * 0.02, ccy - cw * 0.06)
+        left = (ccx - cw * 0.28, ccy + cw * 0.08)
+        right = (ccx + cw * 0.30, ccy + cw * 0.05)
+        for (ex, ey), r in ((left, r_left), (mid, r_mid), (right, r_right)):
+            d.ellipse([ex - r, ey - r, ex + r, ey + r], fill=fill)
+        d.rectangle([left[0], ccy + cw * 0.02, right[0], ccy + cw * 0.14], fill=fill)
+
+    def drop(dx, dy, h):
+        d.line([dx, dy, dx - h * 0.35, dy + h], fill=fill, width=lw)
+
+    def flake(fx, fy, r):
+        for i in range(3):
+            a = i * math.pi / 3
+            d.line([fx - math.cos(a) * r, fy - math.sin(a) * r,
+                    fx + math.cos(a) * r, fy + math.sin(a) * r],
+                   fill=fill, width=max(2, lw - 1))
+
+    k = (kind or "").upper()
+    if k == "SUN":
+        sun(cx, cy, s * 0.27)
+    elif k == "CLOUD":
+        cloud(cx, cy, s * 0.92)
+    elif k == "SUN_CLOUD":
+        sun(cx + s * 0.20, cy - s * 0.20, s * 0.16)
+        cloud(cx - s * 0.04, cy + s * 0.10, s * 0.80)
+    elif k == "RAIN":
+        cloud(cx, cy - s * 0.12, s * 0.82)
+        for off in (-0.22, 0.0, 0.22):
+            drop(cx + off * s, cy + s * 0.26, s * 0.20)
+    elif k == "SNOW":
+        cloud(cx, cy - s * 0.12, s * 0.82)
+        for off in (-0.20, 0.04, 0.24):
+            flake(cx + off * s, cy + s * 0.34, s * 0.08)
+    elif k == "HAZE":
+        for i, fy in enumerate((cy - s * 0.22, cy - s * 0.02, cy + s * 0.18)):
+            half = s * (0.34 - i * 0.04)
+            d.line([cx - half, fy, cx + half, fy], fill=fill, width=lw)
+
+
 def f(key: str, size: int) -> ImageFont.FreeTypeFont:
     """Resolve a font by logical key; checks per-render overrides first.
 
@@ -918,8 +976,14 @@ def _draw_weather_flanks(d: ImageDraw.ImageDraw, y: int, *, time_left: int, time
 
     cond_zh = weather_api.skycon_zh(skycon or "")
     if cond_zh:
+        icon_kind = SKYCON_TO_ICON.get(skycon or "")
         sw = text_w(d, cond_zh, f_cond_zh)
         y_cond = rstart_y + 4 * line_h - 12  # 第 5 行（日落）基线，48px 字号微上调以收齐底
+        # 天气状况：矢量图标 + 中文并排，整体右对齐到 left_x_end（图标在中文左侧）
+        icon_sz, icon_gap = 58, 16
+        block_w = (icon_sz + icon_gap if icon_kind else 0) + sw
+        if icon_kind:
+            draw_wx_icon(d, left_x_end - block_w + icon_sz / 2, y_cond + 22, icon_sz, icon_kind)
         d.text((left_x_end - sw, y_cond), cond_zh, font=f_cond_zh, fill=BLACK)
 
 
